@@ -126,6 +126,14 @@ func parseBulk(reader *bufio.Reader, ch chan *Payload, line []byte) {
 		ch <- &Payload{Err: err}
 		return
 	}
+
+	if strlen == -1 {
+		ch <- &Payload{
+			Data: resp.MakeBulkReply(nil), // 返回 Null
+		}
+		return
+	}
+
 	strBuf := make([]byte, strlen+2)
 	_, err = io.ReadFull(reader, strBuf)
 	if err != nil {
