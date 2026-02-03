@@ -31,12 +31,10 @@ type EchoHandler struct {
 func (h *EchoHandler) Close() error {
 	// 1. 先设置关闭标识，让 Handle 方法不再接受新连接（虽然 Accept 会在框架层停掉，但这是双重保险）
 	h.closing.Set(true)
-
 	// 2. 遍历 activeConn，取出所有客户端并关闭
 	// sync.Map.Range 可以安全地遍历
 	h.activeConn.Range(func(key, value interface{}) bool {
 		client := key.(*EchoClient)
-		// 调用你之前定义的那个 Close 函数，它会安全地等待写操作完成再关闭连接
 		_ = Close(client)
 		return true // 返回 true 继续遍历下一个
 	})

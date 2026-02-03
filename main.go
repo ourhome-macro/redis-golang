@@ -16,7 +16,6 @@ func main() {
 	}
 
 	// 2. 准备 Handler
-	// 使用你之前定义好的 EchoHandler
 	// 因为 EchoHandler 已经实现了 Handle 和 Close 方法，所以它实现了 Handler 接口
 	handler := tcp.MakeEchoHandler()
 
