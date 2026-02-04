@@ -5,7 +5,9 @@ import (
 	"MiddlewareSelf/redis/resp"
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
+	"os"
 	"strconv"
 	//"strings"
 )
@@ -25,15 +27,25 @@ func ParseStream(reader io.Reader) <-chan *Payload {
 }
 
 func parse(rawReader io.Reader, ch chan *Payload) {
+	defer close(ch)
 	reader := bufio.NewReader(rawReader)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			ch <- &Payload{Err: err}
-			close(ch)
+			if err == io.EOF {
+				ch <- &Payload{Err: errors.New("EOF")}
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				ch <- &Payload{Err: errors.New("os.ErrDeadlineExceeded")}
+			}
+			//close(ch)
 			return
 		}
 		line = bytes.TrimSuffix(line, []byte{'\r', '\n'})
+		if len(line) == 0 {
+			ch <- &Payload{Err: errors.New("empty line")}
+			continue
+		}
 		switch line[0] {
 		case '+':
 			content := string(line[1:])
@@ -50,7 +62,7 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 		case ':':
 			content, err := strconv.ParseInt(string(line[1:]), 10, 64)
 			if err != nil {
-				ch <- &Payload{Err: err}
+				ch <- &Payload{Err: errors.New("::invalid parseInt")}
 				close(ch)
 				return
 			}
@@ -61,6 +73,8 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 			parseBulk(reader, ch, line)
 		case '*':
 			parseArray(reader, ch, line)
+		default:
+			ch <- &Payload{Err: errors.New("error pattern.please write again")}
 		}
 	}
 }
@@ -68,6 +82,7 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 	nStrs, err := strconv.ParseInt(string(header[1:]), 10, 64)
 	if err != nil || nStrs < -1 {
+		ch <- &Payload{Err: errors.New("invalid array format")}
 		return
 	} else if nStrs == -1 {
 		// Null Array
@@ -87,7 +102,7 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 	for i := int64(0); i < nStrs; i++ {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			ch <- &Payload{Err: err}
+			ch <- &Payload{Err: errors.New("invalid array length")}
 			return
 		}
 
@@ -109,7 +124,7 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 			body := make([]byte, strLen+2)
 			_, err := io.ReadFull(reader, body)
 			if err != nil {
-				ch <- &Payload{Err: err}
+				ch <- &Payload{Err: errors.New("invalid array parse")}
 				return
 			}
 			lines = append(lines, body[:strLen])
@@ -123,7 +138,7 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 func parseBulk(reader *bufio.Reader, ch chan *Payload, line []byte) {
 	strlen, err := strconv.ParseInt(string(line[1:]), 10, 64)
 	if err != nil {
-		ch <- &Payload{Err: err}
+		ch <- &Payload{Err: errors.New("$$invalid parseInt")}
 		return
 	}
 
@@ -137,7 +152,8 @@ func parseBulk(reader *bufio.Reader, ch chan *Payload, line []byte) {
 	strBuf := make([]byte, strlen+2)
 	_, err = io.ReadFull(reader, strBuf)
 	if err != nil {
-		ch <- &Payload{Err: err}
+		ch <- &Payload{Err: errors.New("invalid bulk parse")}
+		//close(ch)
 		return
 	}
 	ch <- &Payload{

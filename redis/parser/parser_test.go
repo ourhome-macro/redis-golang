@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,5 +92,36 @@ func assertReplyEqual(t *testing.T, actual, expected _interface.Reply) {
 
 	if !bytes.Equal(aBytes, eBytes) {
 		t.Errorf("Reply mismatch:\nExpected: %q\nActual:   %q", string(eBytes), string(aBytes))
+	}
+}
+
+// 测试各种边界情况
+func TestParser(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"simple string", "+OK\r\n", false},
+		{"error", "-Error message\r\n", false},
+		{"integer", ":1000\r\n", false},
+		{"null bulk string", "$-1\r\n", false},
+		{"empty bulk string", "$0\r\n\r\n", false},
+		{"bulk string", "$5\r\nhello\r\n", false},
+		{"null array", "*-1\r\n", false},
+		{"empty array", "*0\r\n", false},
+		{"array", "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n", false},
+		{"invalid format", "invalid\r\n", true},
+		{"incomplete", "+OK", true}, // 缺少\r\n
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := ParseStream(strings.NewReader(tt.input))
+			payload := <-ch
+			if (payload.Err != nil) != tt.wantErr {
+				t.Errorf("ParseStream() error = %v, wantErr %v", payload.Err, tt.wantErr)
+			}
+		})
 	}
 }
