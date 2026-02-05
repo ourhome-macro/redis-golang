@@ -87,7 +87,7 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 	} else if nStrs == -1 {
 		// Null Array
 		ch <- &Payload{
-			Data: resp.MakeArrayReply(nil), // 确保你的 resp 包里有这个方法
+			Data: resp.MakeArrayReply(nil),
 		}
 		return
 	} else if nStrs == 0 {
