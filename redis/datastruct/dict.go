@@ -3,6 +3,7 @@ package datastruct
 import (
 	"container/list"
 	"sync"
+	"time"
 )
 
 const DefaultCapacity = 64 * 1024 * 1024 // 64MB
@@ -23,6 +24,7 @@ type entity struct {
 	key      string
 	value    Value
 	listElem *list.Element
+	expire   int64 //ms
 }
 
 func MakeDict() *Dict {
@@ -46,33 +48,57 @@ func (d *Dict) Get(key string) (Value, bool) {
 	defer d.mu.Unlock()
 
 	if v, ok := d.data[key]; ok {
-		d.ll.MoveToFront(v.listElem)
-		return v.value, true
+		//惰性删除
+		if v.expire > 0 && time.Now().UnixNano() > v.expire {
+			d.ll.Remove(v.listElem)
+			delete(d.data, v.key)
+			d.nbytes -= int64(len(v.key)) + int64(v.value.Len())
+			//delete(d.data, key)
+			return nil, false
+		} else {
+			d.ll.MoveToFront(v.listElem)
+			return v.value, true
+		}
 	}
 	return nil, false
 }
 
-func (d *Dict) Set(key string, value Value) {
+func (d *Dict) SetWithTTL(key string, value Value, ttl int64) {
+	//ttl: ms
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
+	var expire int64
+	if ttl > 0 {
+		expire = time.Now().UnixNano() + ttl*1e6
+	} else {
+		expire = 0
+	}
 	if v, ok := d.data[key]; ok {
 		// 已有 Key
 		delta := int64(value.Len() - v.value.Len())
 		d.nbytes += delta
 		v.value = value
 		d.ll.MoveToFront(v.listElem)
+		v.expire = expire
 	} else {
 		// 新增 Key
-		ent := &entity{key: key, value: value}
+		ent := &entity{
+			key:    key,
+			value:  value,
+			expire: expire,
+		}
 		ent.listElem = d.ll.PushFront(ent)
 		d.data[key] = ent
 		d.nbytes += int64(len(key)) + int64(value.Len())
+		//v.expire = expire
 	}
-
 	for d.capacity > 0 && d.nbytes > d.capacity {
 		d.RemoveOldest()
 	}
+}
+
+func (d *Dict) Set(key string, value Value) {
+	d.SetWithTTL(key, value, 0)
 }
 
 func (d *Dict) RemoveOldest() {
