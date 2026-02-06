@@ -6,14 +6,12 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync/atomic"
 )
 
-// TODO 完成每一个db隔离
 const MaxNumber = 16
 
 type Db struct {
-	index int64
+	//index int64
 	dicts []*datastruct.Dict
 }
 
@@ -23,25 +21,27 @@ func MakeDbs() *Db {
 		dicts[i] = datastruct.MakeDict()
 	}
 	return &Db{
-		index: 0,
 		dicts: dicts,
 	}
 }
 
-func (db *Db) Select(index int) bool {
-	if index < 0 || index >= MaxNumber {
-		return false
+//func (db *Db) Select(index int) bool {
+//	if index < 0 || index >= MaxNumber {
+//		return false
+//	}
+//	atomic.StoreInt64(&db.index, int64(index))
+//	return true
+//}
+
+func (db *Db) GetDict(index int) (*datastruct.Dict, error) {
+	if index < 0 || index >= 16 {
+		return nil, errors.New("index out of range")
 	}
-	atomic.StoreInt64(&db.index, int64(index))
-	return true
+	return db.dicts[index], nil
 }
 
-func (db *Db) GetDict() *datastruct.Dict {
-	idx := atomic.LoadInt64(&db.index)
-	return db.dicts[int(idx)]
-}
-
-func (db *Db) Exec(args [][]byte) (interface{}, error) {
+// 让外层调用此函数的存储index状态
+func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 	//db.mu.Lock()
 	//defer db.mu.Unlock()
 	if len(args) == 0 {
@@ -49,22 +49,25 @@ func (db *Db) Exec(args [][]byte) (interface{}, error) {
 	}
 
 	cmd := strings.ToUpper(string(args[0]))
-
 	if cmd == "SELECT" {
 		if len(args) != 2 {
 			return nil, errors.New("wrong number of arguments for 'select'")
 		}
-		index, err := strconv.Atoi(string(args[1]))
+		ind, err := strconv.Atoi(string(args[1]))
 		if err != nil {
 			return nil, errors.New("invalid index argument")
 		}
-		if db.Select(index) {
+		//index = ind
+		if ind >= 0 && ind < 16 {
 			return "OK", nil
 		}
 		return nil, errors.New("DB index out of range")
 	}
 
-	dict := db.GetDict()
+	dict, err := db.GetDict(index)
+	if err != nil {
+		return nil, err
+	}
 
 	switch cmd {
 	case "SET":
@@ -72,7 +75,7 @@ func (db *Db) Exec(args [][]byte) (interface{}, error) {
 			return nil, errors.New("wrong number of arguments for 'set'")
 		}
 		key := string(args[1])
-		// 修正：直接把 []byte 包装成 DataObject
+		//[]byte 包装成 DataObject
 		val := NewDataObject(args[2])
 
 		dict.Set(key, val)
@@ -83,12 +86,10 @@ func (db *Db) Exec(args [][]byte) (interface{}, error) {
 			return nil, errors.New("wrong number of arguments for 'get'")
 		}
 		key := string(args[1])
-
 		val, ok := dict.Get(key)
 		if !ok {
 			return nil, nil
 		}
-
 		// 断言
 		if dobj, ok := val.(*DataObject); ok {
 			return dobj.Bytes(), nil
