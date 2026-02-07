@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+//TODO :采用函数式编程来包装exec从而引入aof
+
 const MaxNumber = 16
 
 type Db struct {
