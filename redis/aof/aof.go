@@ -15,7 +15,7 @@ const (
 )
 
 type AOF struct {
-	file        *os.File
+	File        *os.File
 	fileName    string
 	bufWriter   *bufio.Writer
 	rewriteChan chan struct{}
@@ -34,7 +34,7 @@ func NewAOF(fileName string, policy SyncPolicy) (*AOF, error) {
 		}
 	}
 	aof := &AOF{
-		file:        f,
+		File:        f,
 		fileName:    fileName,
 		rewriteChan: make(chan struct{}),
 		stopChan:    make(chan struct{}),
@@ -57,7 +57,7 @@ func (aof *AOF) syncLoop() {
 			return
 		case <-ticker.C:
 			_ = aof.bufWriter.Flush()
-			_ = aof.file.Sync()
+			_ = aof.File.Sync()
 		}
 	}
 }
@@ -67,14 +67,18 @@ func (aof *AOF) Close() {
 		close(aof.stopChan)
 		time.Sleep(100 * time.Millisecond)
 	}
-	if aof.file != nil {
-		_ = aof.file.Close()
+	if aof.File != nil {
+		_ = aof.File.Close()
 	}
 	if aof.bufWriter != nil {
 		_ = aof.bufWriter.Flush()
 	}
 }
 
-//TODO 追加命令
-
-//TODO 加载命令
+func IsWriteCmd(cmd string) bool {
+	switch cmd {
+	case "SET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "SETWITHTTL":
+		return true
+	}
+	return false
+}

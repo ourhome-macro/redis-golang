@@ -1,7 +1,9 @@
 package database
 
 import (
+	"MiddlewareSelf/redis/aof"
 	"MiddlewareSelf/redis/datastruct"
+	"MiddlewareSelf/redis/resp"
 	"errors"
 	"fmt"
 	"strconv"
@@ -15,6 +17,7 @@ const MaxNumber = 16
 type Db struct {
 	//index int64
 	dicts []*datastruct.Dict
+	aof   *aof.AOF
 }
 
 func MakeDbs() *Db {
@@ -70,6 +73,7 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	var reply interface{}
 
 	switch cmd {
 	case "SET":
@@ -77,11 +81,9 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 			return nil, errors.New("wrong number of arguments for 'set'")
 		}
 		key := string(args[1])
-		//[]byte 包装成 DataObject
 		val := NewDataObject(args[2])
-
 		dict.Set(key, val)
-		return "OK", nil
+		reply = "OK" // Redis SET 返回 OK
 
 	case "GET":
 		if len(args) != 2 {
@@ -92,17 +94,14 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 		if !ok {
 			return nil, nil
 		}
-		// 断言
 		if dobj, ok := val.(*DataObject); ok {
-			return dobj.Bytes(), nil
+			reply = dobj.Bytes()
 		}
-		return nil, errors.New("type assertion failed")
 
 	case "DEL":
 		if len(args) < 2 {
 			return nil, errors.New("wrong number of arguments for 'del'")
 		}
-
 		count := 0
 		for i := 1; i < len(args); i++ {
 			key := string(args[i])
@@ -111,9 +110,17 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 				count++
 			}
 		}
-		return count, nil
-
+		reply = count
 	default:
 		return nil, fmt.Errorf("unknown command '%s'", cmd)
 	}
+
+	if aof.IsWriteCmd(cmd) {
+		respData := resp.MakeArrayReply(args).ToBytes()
+		if db.aof != nil {
+			_, _ = db.aof.File.Write(respData)
+		}
+	}
+
+	return reply, nil
 }
