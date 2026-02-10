@@ -3,9 +3,11 @@ package database
 import (
 	"MiddlewareSelf/redis/aof"
 	"MiddlewareSelf/redis/datastruct"
+	"MiddlewareSelf/redis/parser"
 	"MiddlewareSelf/redis/resp"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -25,9 +27,26 @@ func MakeDbs() *Db {
 	for i := 0; i < MaxNumber; i++ {
 		dicts[i] = datastruct.MakeDict()
 	}
-	return &Db{
+	file, _ := os.Open("redis.aof")
+	defer file.Close()
+	ch := parser.ParseStream(file)
+	db := &Db{
 		dicts: dicts,
 	}
+
+	for payLoad := range ch {
+		if payLoad == nil {
+
+			continue
+		}
+		if arr, ok := payLoad.Data.(*resp.ArrayReply); ok {
+			_, exec := db.Exec(0, arr.Args)
+			if exec != nil {
+				return nil
+			} // TODO 后续处理这个index问题
+		}
+	}
+	return db
 }
 
 //func (db *Db) Select(index int) bool {

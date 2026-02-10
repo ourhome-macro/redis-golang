@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const AofName = "redis.aof"
+
 type SyncPolicy int
 
 const (
@@ -23,7 +25,8 @@ type AOF struct {
 	syncPolicy  SyncPolicy
 }
 
-func NewAOF(fileName string, policy SyncPolicy) (*AOF, error) {
+func NewAOF(policy SyncPolicy) (*AOF, error) {
+	fileName := AofName
 	//开启读写追加文件
 	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	//var fd *os.File
