@@ -207,6 +207,22 @@ func (db *Db) RewriteAOF(ctx context.Context) error {
 	return db.aof.Rewrite(ctx)
 }
 
+// StartAutoRewriteLoop 启动 AOF 自动重写后台循环。
+func (db *Db) StartAutoRewriteLoop(interval time.Duration, minSizeBytes int64, growthPercent float64) error {
+	if db.aof == nil {
+		return errors.New("aof is not enabled")
+	}
+	db.aof.StartAutoRewriteLoop(interval, minSizeBytes, growthPercent)
+	return nil
+}
+
+// Close 关闭底层资源（当前主要是 AOF 文件与后台协程）。
+func (db *Db) Close() {
+	if db.aof != nil {
+		db.aof.Close()
+	}
+}
+
 func (db *Db) snapshotForRewrite() ([]aof.RewriteCommand, error) {
 	now := int64(0)
 	now = time.Now().UnixNano()
