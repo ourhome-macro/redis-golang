@@ -63,7 +63,6 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 			content, err := strconv.ParseInt(string(line[1:]), 10, 64)
 			if err != nil {
 				ch <- &Payload{Err: errors.New("::invalid parseInt")}
-				close(ch)
 				return
 			}
 			ch <- &Payload{
@@ -105,16 +104,19 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 			ch <- &Payload{Err: errors.New("invalid array length")}
 			return
 		}
+		line = bytes.TrimSuffix(line, []byte{'\r', '\n'})
 
 		// 简单检查格式，必须以 $ 开头
 		if len(line) < 2 || line[0] != '$' {
+			ch <- &Payload{Err: errors.New("invalid array element header")}
 			return
 		}
 
-		strLenStr := string(line[1 : len(line)-2])
+		strLenStr := string(line[1:])
 		strLen, err := strconv.ParseInt(strLenStr, 10, 64)
 
 		if err != nil || strLen < -1 {
+			ch <- &Payload{Err: errors.New("invalid array bulk length")}
 			return
 		}
 
@@ -154,6 +156,10 @@ func parseBulk(reader *bufio.Reader, ch chan *Payload, line []byte) {
 	if err != nil {
 		ch <- &Payload{Err: errors.New("invalid bulk parse")}
 		//close(ch)
+		return
+	}
+	if !bytes.HasSuffix(strBuf, []byte{'\r', '\n'}) {
+		ch <- &Payload{Err: errors.New("invalid bulk parse: missing CRLF")}
 		return
 	}
 	ch <- &Payload{
