@@ -27,6 +27,14 @@ type entity struct {
 	expire   int64 //ms
 }
 
+// SnapshotItem 是 Dict 快照项。
+// ExpireAtNano 为绝对过期时间（UnixNano），0 表示永不过期。
+type SnapshotItem struct {
+	Key          string
+	Value        Value
+	ExpireAtNano int64
+}
+
 func MakeDict() *Dict {
 	return &Dict{
 		data:     make(map[string]*entity),
@@ -133,4 +141,31 @@ func (d *Dict) Clear() {
 	d.data = make(map[string]*entity)
 	d.ll.Init()
 	d.nbytes = 0
+}
+
+// Snapshot 返回当前字典的只读快照切片。
+//
+// 并发说明：
+// - C 版 Redis 在 fork 后由子进程基于 COW 读取“时间点快照”；
+// - Go 里没有直接 fork+COW 语义，这里通过 RLock 在短临界区复制索引项，
+//   后续重写线程使用复制出来的切片，避免长时间阻塞主线程写请求。
+func (d *Dict) Snapshot() []SnapshotItem {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	now := time.Now().UnixNano()
+	items := make([]SnapshotItem, 0, len(d.data))
+	for _, ent := range d.data {
+		// 跳过已经过期的数据
+		if ent.expire > 0 && now > ent.expire {
+			continue
+		}
+		items = append(items, SnapshotItem{
+			Key:          ent.key,
+			Value:        ent.value,
+			ExpireAtNano: ent.expire,
+		})
+	}
+
+	return items
 }
