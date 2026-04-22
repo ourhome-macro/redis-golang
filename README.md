@@ -1,5 +1,7 @@
 # redis-golang
 
+See [ROADMAP.md](./ROADMAP.md) for the execution order from single-node hardening to replication, sharding, and cluster work.
+
 一个使用 Go 实现的 Redis 学习型项目，目标是把 **网络层 / RESP 协议 / 数据结构 / AOF 持久化 / Rewrite** 串成一个可运行骨架。
 
 ---
