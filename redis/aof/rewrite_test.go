@@ -7,8 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -49,7 +49,7 @@ func TestRewriteMergeIncrementalBuffer(t *testing.T) {
 	mu.Lock()
 	state["k2"] = "v2"
 	mu.Unlock()
-	if err := a.AppendCommand([][]byte{[]byte("SET"), []byte("k2"), []byte("v2")}); err != nil {
+	if err := a.AppendCommand(0, [][]byte{[]byte("SET"), []byte("k2"), []byte("v2")}); err != nil {
 		t.Fatalf("AppendCommand during rewrite failed: %v", err)
 	}
 
@@ -63,15 +63,18 @@ func TestRewriteMergeIncrementalBuffer(t *testing.T) {
 	}
 
 	cmds := readAOFCommands(t, aofPath)
-	if len(cmds) != 2 {
-		t.Fatalf("expected 2 commands in final aof, got %d", len(cmds))
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 commands in final aof, got %d", len(cmds))
 	}
 
 	if string(cmds[0][0]) != "SET" || string(cmds[0][1]) != "k1" || string(cmds[0][2]) != "v1" {
 		t.Fatalf("unexpected first command: %q %q %q", cmds[0][0], cmds[0][1], cmds[0][2])
 	}
-	if string(cmds[1][0]) != "SET" || string(cmds[1][1]) != "k2" || string(cmds[1][2]) != "v2" {
-		t.Fatalf("unexpected second command: %q %q %q", cmds[1][0], cmds[1][1], cmds[1][2])
+	if string(cmds[1][0]) != "SELECT" || string(cmds[1][1]) != "0" {
+		t.Fatalf("unexpected second command: %q %q", cmds[1][0], cmds[1][1])
+	}
+	if string(cmds[2][0]) != "SET" || string(cmds[2][1]) != "k2" || string(cmds[2][2]) != "v2" {
+		t.Fatalf("unexpected third command: %q %q %q", cmds[2][0], cmds[2][1], cmds[2][2])
 	}
 }
 
@@ -100,13 +103,13 @@ func TestRewriteFailCleanupAndRecover(t *testing.T) {
 	}
 
 	// 失败后仍可继续写主 AOF，证明回滚恢复可用。
-	if err := a.AppendCommand([][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
+	if err := a.AppendCommand(0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
 		t.Fatalf("append after failed rewrite should succeed, got: %v", err)
 	}
 
 	cmds := readAOFCommands(t, aofPath)
-	if len(cmds) != 1 {
-		t.Fatalf("expected 1 command after append, got %d", len(cmds))
+	if len(cmds) != 2 {
+		t.Fatalf("expected 2 commands after append, got %d", len(cmds))
 	}
 }
 
@@ -127,7 +130,7 @@ func TestAutoRewriteLoopTrigger(t *testing.T) {
 	})
 
 	a.StartAutoRewriteLoop(20*time.Millisecond, 1, 50)
-	if err := a.AppendCommand([][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
+	if err := a.AppendCommand(0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
 

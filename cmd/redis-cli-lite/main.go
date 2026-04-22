@@ -106,8 +106,8 @@ func main() {
 
 		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 		ch, err := cli.ExecStream(ctx, []client.Command{cmd})
-		cancel()
 		if err != nil {
+			cancel()
 			fmt.Printf("(error) %v\n", err)
 			continue
 		}
@@ -119,6 +119,7 @@ func main() {
 			}
 			fmt.Println(formatRESPHuman(string(res.Reply.ToBytes())))
 		}
+		cancel()
 	}
 }
 

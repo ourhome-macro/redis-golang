@@ -22,16 +22,15 @@ func (w *Wait) Wait() {
 }
 
 func (w *Wait) WaitWithTimeout(timeout time.Duration) bool {
-	c := make(chan struct{})
+	done := make(chan struct{})
 
 	go func() {
-		defer close(c)
 		w.Wait()
-		c <- struct{}{}
+		close(done)
 	}()
 
 	select {
-	case <-c:
+	case <-done:
 		return false
 
 	case <-time.After(timeout):

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -27,11 +28,11 @@ const (
 )
 
 type AOF struct {
-	File        *os.File
-	fileName    string
-	bufWriter   *bufio.Writer
-	stopChan    chan struct{}
-	syncPolicy  SyncPolicy
+	File       *os.File
+	fileName   string
+	bufWriter  *bufio.Writer
+	stopChan   chan struct{}
+	syncPolicy SyncPolicy
 
 	mu            sync.Mutex
 	rewriting     bool
@@ -62,12 +63,12 @@ func NewAOFWithFile(policy SyncPolicy, fileName string) (*AOF, error) {
 		}
 	}
 	aof := &AOF{
-		File:        f,
-		fileName:    fileName,
-		stopChan:    make(chan struct{}),
-		bufWriter:   bufio.NewWriter(f),
-		syncPolicy:  policy,
-		rewriting:   false,
+		File:            f,
+		fileName:        fileName,
+		stopChan:        make(chan struct{}),
+		bufWriter:       bufio.NewWriter(f),
+		syncPolicy:      policy,
+		rewriting:       false,
 		autoRewriteStop: make(chan struct{}),
 	}
 	if fi, statErr := f.Stat(); statErr == nil {
@@ -106,12 +107,15 @@ func (aof *AOF) SetSnapshotProvider(provider SnapshotProvider) {
 
 // AppendCommand 以 RESP Array 格式将命令写入 AOF。
 // 如果重写正在进行，会把同一份命令追加到 rewrite buffer（模拟 COW 增量收集）。
-func (aof *AOF) AppendCommand(args [][]byte) error {
+func (aof *AOF) AppendCommand(dbIndex int, args [][]byte) error {
 	if len(args) == 0 {
 		return fmt.Errorf("empty command args")
 	}
+	if dbIndex < 0 {
+		return fmt.Errorf("invalid db index %d", dbIndex)
+	}
 
-	encoded := encodeRESPCommand(args)
+	encoded := encodeAOFEntry(dbIndex, args)
 
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
@@ -143,6 +147,19 @@ func (aof *AOF) AppendCommand(args [][]byte) error {
 
 func encodeRESPCommand(args [][]byte) []byte {
 	return resp.MakeArrayReply(args).ToBytes()
+}
+
+func encodeAOFEntry(dbIndex int, args [][]byte) []byte {
+	selectCmd := encodeRESPCommand([][]byte{
+		[]byte("SELECT"),
+		[]byte(strconv.Itoa(dbIndex)),
+	})
+	writeCmd := encodeRESPCommand(args)
+
+	out := make([]byte, 0, len(selectCmd)+len(writeCmd))
+	out = append(out, selectCmd...)
+	out = append(out, writeCmd...)
+	return out
 }
 
 func (aof *AOF) Close() {

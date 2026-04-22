@@ -129,6 +129,10 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
 				ch <- &Payload{Err: errors.New("invalid array parse")}
 				return
 			}
+			if !bytes.HasSuffix(body, []byte{'\r', '\n'}) {
+				ch <- &Payload{Err: errors.New("invalid array parse: missing CRLF")}
+				return
+			}
 			lines = append(lines, body[:strLen])
 		}
 	}
