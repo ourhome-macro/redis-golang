@@ -145,6 +145,38 @@ func TestAutoRewriteLoopTrigger(t *testing.T) {
 	t.Fatal("auto rewrite was not triggered")
 }
 
+func TestAppendCommandWritesSelectOnlyOnDBChange(t *testing.T) {
+	dir := t.TempDir()
+	aofPath := filepath.Join(dir, AofName)
+
+	a, err := NewAOFWithFile(SyncAlways, aofPath)
+	if err != nil {
+		t.Fatalf("NewAOFWithFile failed: %v", err)
+	}
+	defer a.Close()
+
+	if err := a.AppendCommand(0, [][]byte{[]byte("SET"), []byte("k1"), []byte("v1")}); err != nil {
+		t.Fatalf("append first command failed: %v", err)
+	}
+	if err := a.AppendCommand(0, [][]byte{[]byte("SET"), []byte("k2"), []byte("v2")}); err != nil {
+		t.Fatalf("append second command failed: %v", err)
+	}
+	if err := a.AppendCommand(1, [][]byte{[]byte("SET"), []byte("k3"), []byte("v3")}); err != nil {
+		t.Fatalf("append third command failed: %v", err)
+	}
+
+	cmds := readAOFCommands(t, aofPath)
+	if len(cmds) != 5 {
+		t.Fatalf("expected 5 commands in aof, got %d", len(cmds))
+	}
+
+	assertCommand(t, cmds[0], "SELECT", "0")
+	assertCommand(t, cmds[1], "SET", "k1", "v1")
+	assertCommand(t, cmds[2], "SET", "k2", "v2")
+	assertCommand(t, cmds[3], "SELECT", "1")
+	assertCommand(t, cmds[4], "SET", "k3", "v3")
+}
+
 func readAOFCommands(t *testing.T, path string) [][][]byte {
 	t.Helper()
 	f, err := os.Open(path)
@@ -172,4 +204,17 @@ func readAOFCommands(t *testing.T, path string) [][][]byte {
 		out = append(out, arr.Args)
 	}
 	return out
+}
+
+func assertCommand(t *testing.T, actual [][]byte, expected ...string) {
+	t.Helper()
+
+	if len(actual) != len(expected) {
+		t.Fatalf("expected command len=%d, got %d", len(expected), len(actual))
+	}
+	for i := range expected {
+		if string(actual[i]) != expected[i] {
+			t.Fatalf("expected arg #%d to be %q, got %q", i, expected[i], string(actual[i]))
+		}
+	}
 }

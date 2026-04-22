@@ -59,7 +59,7 @@ func TestRewriteKeepsDatabaseIndex(t *testing.T) {
 	assertBulkValue(t, reloaded, 2, "k2", "v2")
 }
 
-func TestExecDoesNotMutateWhenAppendFails(t *testing.T) {
+func TestExecMutatesBeforeAppendFails(t *testing.T) {
 	chdirTemp(t)
 
 	db := MakeDbs()
@@ -80,8 +80,16 @@ func TestExecDoesNotMutateWhenAppendFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after failed set returned error: %v", err)
 	}
-	if reply != nil {
-		t.Fatalf("key should not exist after failed append, got %q", reply)
+	got, ok := reply.([]byte)
+	if !ok {
+		t.Fatalf("expected bulk reply after failed append, got %T", reply)
+	}
+	if string(got) != "v" {
+		t.Fatalf("expected key to stay in memory after failed append, got %q", string(got))
+	}
+
+	if db.aof.LastWriteError() == nil {
+		t.Fatal("expected AOF last write status to record the failure")
 	}
 }
 

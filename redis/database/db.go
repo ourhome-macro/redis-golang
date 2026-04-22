@@ -96,13 +96,18 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 		return nil, err
 	}
 
+	reply, err := plan.exec()
+	if err != nil {
+		return nil, err
+	}
+
 	if plan.write && db.aof != nil {
 		if err := db.aof.AppendCommand(index, args); err != nil {
-			return nil, err
+			return reply, err
 		}
 	}
 
-	return plan.exec()
+	return reply, nil
 }
 
 func (db *Db) EnableAOF(policy aof.SyncPolicy) error {

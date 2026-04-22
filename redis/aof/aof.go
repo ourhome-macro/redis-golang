@@ -13,18 +13,16 @@ import (
 )
 
 const (
-	// AofName 为当前默认 AOF 文件名（对齐 Redis appendonly.aof 命名）。
-	AofName = "appendonly.aof"
-	// RewriteTempName 为重写阶段的临时文件。
+	AofName         = "appendonly.aof"
 	RewriteTempName = "temp.aof"
 )
 
 type SyncPolicy int
 
 const (
-	SyncAlways   SyncPolicy = iota // 每次写都同步
-	SyncEverySec                   // 每秒同步
-	SyncNo                         // 由操作系统决定
+	SyncAlways SyncPolicy = iota
+	SyncEverySec
+	SyncNo
 )
 
 type AOF struct {
@@ -37,8 +35,10 @@ type AOF struct {
 	mu            sync.Mutex
 	rewriting     bool
 	rewriteBuffer [][]byte
+	currentDB     int
+	rewriteDB     int
+	lastWriteErr  error
 
-	// snapshotProvider 由上层（DB）注入，用于提供“fork 时刻”的只读快照命令。
 	snapshotProvider SnapshotProvider
 
 	autoRewriteStop chan struct{}
@@ -54,7 +54,6 @@ func NewAOF(policy SyncPolicy) (*AOF, error) {
 }
 
 func NewAOFWithFile(policy SyncPolicy, fileName string) (*AOF, error) {
-	//开启读写追加文件
 	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		f, err = os.Create(fileName)
@@ -62,13 +61,15 @@ func NewAOFWithFile(policy SyncPolicy, fileName string) (*AOF, error) {
 			return nil, err
 		}
 	}
+
 	aof := &AOF{
 		File:            f,
 		fileName:        fileName,
 		stopChan:        make(chan struct{}),
 		bufWriter:       bufio.NewWriter(f),
 		syncPolicy:      policy,
-		rewriting:       false,
+		currentDB:       -1,
+		rewriteDB:       -1,
 		autoRewriteStop: make(chan struct{}),
 	}
 	if fi, statErr := f.Stat(); statErr == nil {
@@ -77,6 +78,7 @@ func NewAOFWithFile(policy SyncPolicy, fileName string) (*AOF, error) {
 	if policy == SyncEverySec {
 		go aof.syncLoop()
 	}
+
 	log.Printf("[AOF] opened file=%s policy=%d", fileName, policy)
 	return aof, nil
 }
@@ -91,22 +93,30 @@ func (aof *AOF) syncLoop() {
 			return
 		case <-ticker.C:
 			aof.mu.Lock()
-			_ = aof.bufWriter.Flush()
-			_ = aof.File.Sync()
+			if err := aof.bufWriter.Flush(); err != nil {
+				aof.setLastWriteErrLocked(err)
+				aof.mu.Unlock()
+				continue
+			}
+			if err := aof.File.Sync(); err != nil {
+				aof.setLastWriteErrLocked(err)
+				aof.mu.Unlock()
+				continue
+			}
+			aof.setLastWriteErrLocked(nil)
 			aof.mu.Unlock()
 		}
 	}
 }
 
-// SetSnapshotProvider 注入重写快照提供器。
 func (aof *AOF) SetSnapshotProvider(provider SnapshotProvider) {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
 	aof.snapshotProvider = provider
 }
 
-// AppendCommand 以 RESP Array 格式将命令写入 AOF。
-// 如果重写正在进行，会把同一份命令追加到 rewrite buffer（模拟 COW 增量收集）。
+// AppendCommand appends a write command to the live AOF stream.
+// Like Redis, the DB selector is emitted only when the selected DB changes.
 func (aof *AOF) AppendCommand(dbIndex int, args [][]byte) error {
 	if len(args) == 0 {
 		return fmt.Errorf("empty command args")
@@ -115,51 +125,38 @@ func (aof *AOF) AppendCommand(dbIndex int, args [][]byte) error {
 		return fmt.Errorf("invalid db index %d", dbIndex)
 	}
 
-	encoded := encodeAOFEntry(dbIndex, args)
-
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
 
+	encoded := aof.encodeEntryLocked(dbIndex, args, false)
 	if _, err := aof.bufWriter.Write(encoded); err != nil {
+		aof.setLastWriteErrLocked(err)
 		return err
 	}
 
 	switch aof.syncPolicy {
 	case SyncAlways:
 		if err := aof.bufWriter.Flush(); err != nil {
+			aof.setLastWriteErrLocked(err)
 			return err
 		}
 		if err := aof.File.Sync(); err != nil {
+			aof.setLastWriteErrLocked(err)
 			return err
 		}
-	case SyncNo, SyncEverySec:
-		// SyncNo: 依赖 OS；SyncEverySec: 后台 ticker 负责 flush+sync。
+		aof.setLastWriteErrLocked(nil)
+	case SyncEverySec, SyncNo:
+		aof.setLastWriteErrLocked(nil)
 	}
 
 	if aof.rewriting {
-		cmdCopy := make([]byte, len(encoded))
-		copy(cmdCopy, encoded)
+		rewriteEncoded := aof.encodeEntryLocked(dbIndex, args, true)
+		cmdCopy := make([]byte, len(rewriteEncoded))
+		copy(cmdCopy, rewriteEncoded)
 		aof.rewriteBuffer = append(aof.rewriteBuffer, cmdCopy)
 	}
 
 	return nil
-}
-
-func encodeRESPCommand(args [][]byte) []byte {
-	return resp.MakeArrayReply(args).ToBytes()
-}
-
-func encodeAOFEntry(dbIndex int, args [][]byte) []byte {
-	selectCmd := encodeRESPCommand([][]byte{
-		[]byte("SELECT"),
-		[]byte(strconv.Itoa(dbIndex)),
-	})
-	writeCmd := encodeRESPCommand(args)
-
-	out := make([]byte, 0, len(selectCmd)+len(writeCmd))
-	out = append(out, selectCmd...)
-	out = append(out, writeCmd...)
-	return out
 }
 
 func (aof *AOF) Close() {
@@ -174,6 +171,7 @@ func (aof *AOF) Close() {
 		})
 		time.Sleep(100 * time.Millisecond)
 	}
+
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
 
@@ -187,11 +185,12 @@ func (aof *AOF) Close() {
 	log.Printf("[AOF] closed file=%s", aof.fileName)
 }
 
-// StartAutoRewriteLoop 启动自动重写后台循环。
-//
-// 触发条件：
-// 1) 当前 AOF 文件大小 >= minSizeBytes；
-// 2) 相对上次重写后大小增长比例 >= growthPercent（如 100 表示增长 100%）。
+func (aof *AOF) LastWriteError() error {
+	aof.mu.Lock()
+	defer aof.mu.Unlock()
+	return aof.lastWriteErr
+}
+
 func (aof *AOF) StartAutoRewriteLoop(interval time.Duration, minSizeBytes int64, growthPercent float64) {
 	if interval <= 0 {
 		interval = time.Second
@@ -234,6 +233,7 @@ func (aof *AOF) StartAutoRewriteLoop(interval time.Duration, minSizeBytes int64,
 func (aof *AOF) shouldAutoRewrite(minSizeBytes int64, growthPercent float64) (currentSize int64, baseline int64, should bool, err error) {
 	aof.mu.Lock()
 	if err = aof.bufWriter.Flush(); err != nil {
+		aof.setLastWriteErrLocked(err)
 		aof.mu.Unlock()
 		return
 	}
@@ -269,4 +269,35 @@ func IsWriteCmd(cmd string) bool {
 		return true
 	}
 	return false
+}
+
+func encodeRESPCommand(args [][]byte) []byte {
+	return resp.MakeArrayReply(args).ToBytes()
+}
+
+func (aof *AOF) encodeEntryLocked(dbIndex int, args [][]byte, forRewrite bool) []byte {
+	dbTracker := &aof.currentDB
+	if forRewrite {
+		dbTracker = &aof.rewriteDB
+	}
+
+	writeCmd := encodeRESPCommand(args)
+	if *dbTracker == dbIndex {
+		return writeCmd
+	}
+
+	selectCmd := encodeRESPCommand([][]byte{
+		[]byte("SELECT"),
+		[]byte(strconv.Itoa(dbIndex)),
+	})
+	*dbTracker = dbIndex
+
+	out := make([]byte, 0, len(selectCmd)+len(writeCmd))
+	out = append(out, selectCmd...)
+	out = append(out, writeCmd...)
+	return out
+}
+
+func (aof *AOF) setLastWriteErrLocked(err error) {
+	aof.lastWriteErr = err
 }

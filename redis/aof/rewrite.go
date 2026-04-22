@@ -45,6 +45,7 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 	}
 	aof.rewriting = true
 	aof.rewriteBuffer = aof.rewriteBuffer[:0]
+	aof.rewriteDB = -1
 	aof.mu.Unlock()
 
 	start := time.Now()
@@ -117,6 +118,7 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 	defer func() {
 		aof.rewriting = false
 		aof.rewriteBuffer = nil
+		aof.rewriteDB = -1
 	}()
 
 	log.Printf("[AOF-REWRITE] merge incremental buffer, buffered_cmd=%d", len(aof.rewriteBuffer))
@@ -207,6 +209,6 @@ func (aof *AOF) reopenWriter() error {
 	}
 	aof.File = newFile
 	aof.bufWriter = bufio.NewWriter(newFile)
+	aof.currentDB = -1
 	return nil
 }
-
