@@ -46,6 +46,7 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 	aof.rewriting = true
 	aof.rewriteBuffer = aof.rewriteBuffer[:0]
 	aof.rewriteDB = -1
+	aof.rewriteStart = time.Now()
 	aof.mu.Unlock()
 
 	start := time.Now()
@@ -99,6 +100,10 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 		aof.mu.Lock()
 		aof.rewriting = false
 		aof.rewriteBuffer = nil
+		aof.rewriteStart = time.Time{}
+		aof.lastRewriteOK = false
+		aof.lastRewriteAt = time.Now()
+		aof.lastRewriteMs = time.Since(start).Milliseconds()
 		aof.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rewrite canceled: %w", ctx.Err())
@@ -107,6 +112,10 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 			aof.mu.Lock()
 			aof.rewriting = false
 			aof.rewriteBuffer = nil
+			aof.rewriteStart = time.Time{}
+			aof.lastRewriteOK = false
+			aof.lastRewriteAt = time.Now()
+			aof.lastRewriteMs = time.Since(start).Milliseconds()
 			aof.mu.Unlock()
 			_ = os.Remove(tmpPath)
 			return result.err
@@ -119,6 +128,7 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 		aof.rewriting = false
 		aof.rewriteBuffer = nil
 		aof.rewriteDB = -1
+		aof.rewriteStart = time.Time{}
 	}()
 
 	log.Printf("[AOF-REWRITE] merge incremental buffer, buffered_cmd=%d", len(aof.rewriteBuffer))
@@ -172,6 +182,10 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 	if fi, statErr := aof.File.Stat(); statErr == nil {
 		aof.lastRewriteSize = fi.Size()
 	}
+	aof.lastRewriteOK = true
+	aof.lastRewriteAt = time.Now()
+	aof.lastRewriteMs = time.Since(start).Milliseconds()
+	aof.rewriteCount++
 
 	log.Printf("[AOF-REWRITE] done, cost=%s", time.Since(start))
 	return nil

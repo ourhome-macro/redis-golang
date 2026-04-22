@@ -38,6 +38,11 @@ type AOF struct {
 	currentDB     int
 	rewriteDB     int
 	lastWriteErr  error
+	rewriteStart  time.Time
+	rewriteCount  int64
+	lastRewriteOK bool
+	lastRewriteAt time.Time
+	lastRewriteMs int64
 
 	snapshotProvider SnapshotProvider
 
@@ -70,6 +75,7 @@ func NewAOFWithFile(policy SyncPolicy, fileName string) (*AOF, error) {
 		syncPolicy:      policy,
 		currentDB:       -1,
 		rewriteDB:       -1,
+		lastRewriteOK:   true,
 		autoRewriteStop: make(chan struct{}),
 	}
 	if fi, statErr := f.Stat(); statErr == nil {
@@ -81,6 +87,23 @@ func NewAOFWithFile(policy SyncPolicy, fileName string) (*AOF, error) {
 
 	log.Printf("[AOF] opened file=%s policy=%d", fileName, policy)
 	return aof, nil
+}
+
+type PersistenceInfo struct {
+	AOFEnabled           bool
+	AOFCurrentSize       int64
+	AOFBaseSize          int64
+	AOFBufferLength      int
+	AOFRewriteInProgress bool
+	AOFRewriteScheduled  bool
+	AOFCurrentRewriteSec int64
+	AOFLastRewriteSec    int64
+	AOFLastBGRewriteOK   bool
+	AOFLastWriteOK       bool
+	AOFRewriteCount      int64
+	Loading              bool
+	ChangesSinceLastSave int64
+	LastSaveUnixTime     int64
 }
 
 func (aof *AOF) syncLoop() {
@@ -189,6 +212,42 @@ func (aof *AOF) LastWriteError() error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
 	return aof.lastWriteErr
+}
+
+func (aof *AOF) PersistenceInfo() PersistenceInfo {
+	aof.mu.Lock()
+	defer aof.mu.Unlock()
+
+	info := PersistenceInfo{
+		AOFEnabled:           true,
+		AOFBaseSize:          aof.lastRewriteSize,
+		AOFRewriteInProgress: aof.rewriting,
+		AOFRewriteScheduled:  false,
+		AOFLastBGRewriteOK:   aof.lastRewriteOK,
+		AOFLastWriteOK:       aof.lastWriteErr == nil,
+		AOFRewriteCount:      aof.rewriteCount,
+	}
+
+	if aof.bufWriter != nil {
+		info.AOFBufferLength = aof.bufWriter.Buffered()
+	}
+	if aof.File != nil {
+		if fi, err := aof.File.Stat(); err == nil {
+			info.AOFCurrentSize = fi.Size() + int64(info.AOFBufferLength)
+		}
+	}
+	if aof.rewriting && !aof.rewriteStart.IsZero() {
+		info.AOFCurrentRewriteSec = int64(time.Since(aof.rewriteStart).Seconds())
+	} else {
+		info.AOFCurrentRewriteSec = -1
+	}
+	if aof.lastRewriteAt.IsZero() {
+		info.AOFLastRewriteSec = -1
+	} else {
+		info.AOFLastRewriteSec = aof.lastRewriteMs / 1000
+	}
+
+	return info
 }
 
 func (aof *AOF) StartAutoRewriteLoop(interval time.Duration, minSizeBytes int64, growthPercent float64) {

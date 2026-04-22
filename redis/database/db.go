@@ -12,14 +12,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 const MaxNumber = 16
 
 type Db struct {
-	dicts []*datastruct.Dict
-	aof   *aof.AOF
+	dicts        []*datastruct.Dict
+	aof          *aof.AOF
+	dirty        int64
+	lastSaveUnix int64
 }
 
 type commandPlan struct {
@@ -35,6 +38,7 @@ func MakeDbs() *Db {
 
 	db := &Db{dicts: dicts}
 	loadAOF(db)
+	atomic.StoreInt64(&db.lastSaveUnix, time.Now().Unix())
 	return db
 }
 
@@ -99,6 +103,9 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 	reply, err := plan.exec()
 	if err != nil {
 		return nil, err
+	}
+	if plan.write {
+		atomic.AddInt64(&db.dirty, 1)
 	}
 
 	if plan.write && db.aof != nil {
@@ -201,6 +208,20 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 	}
 
 	cmd := strings.ToUpper(string(args[0]))
+	if cmd == "INFO" {
+		if len(args) > 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'info'")
+		}
+		section := "default"
+		if len(args) == 2 {
+			section = strings.ToLower(string(args[1]))
+		}
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				return db.infoReply(section)
+			},
+		}, nil
+	}
 	if cmd == "SELECT" {
 		if len(args) != 2 {
 			return commandPlan{}, errors.New("wrong number of arguments for 'select'")
@@ -324,4 +345,54 @@ func parseSelectIndex(args [][]byte) (int, bool) {
 		return 0, false
 	}
 	return index, true
+}
+
+func (db *Db) infoReply(section string) ([]byte, error) {
+	switch section {
+	case "default", "all", "persistence":
+		return db.persistenceInfoBytes(), nil
+	default:
+		return nil, fmt.Errorf("unsupported INFO section '%s'", section)
+	}
+}
+
+func (db *Db) persistenceInfoBytes() []byte {
+	var info aof.PersistenceInfo
+	if db.aof != nil {
+		info = db.aof.PersistenceInfo()
+	}
+
+	lines := []string{
+		"# Persistence",
+		fmt.Sprintf("loading:%d", boolToInt(info.Loading)),
+		fmt.Sprintf("rdb_changes_since_last_save:%d", atomic.LoadInt64(&db.dirty)),
+		fmt.Sprintf("rdb_last_save_time:%d", atomic.LoadInt64(&db.lastSaveUnix)),
+		fmt.Sprintf("aof_enabled:%d", boolToInt(info.AOFEnabled)),
+		fmt.Sprintf("aof_rewrite_in_progress:%d", boolToInt(info.AOFRewriteInProgress)),
+		fmt.Sprintf("aof_rewrite_scheduled:%d", boolToInt(info.AOFRewriteScheduled)),
+		fmt.Sprintf("aof_last_rewrite_time_sec:%d", info.AOFLastRewriteSec),
+		fmt.Sprintf("aof_current_rewrite_time_sec:%d", info.AOFCurrentRewriteSec),
+		fmt.Sprintf("aof_last_bgrewrite_status:%s", statusString(info.AOFLastBGRewriteOK)),
+		fmt.Sprintf("aof_last_write_status:%s", statusString(info.AOFLastWriteOK)),
+		fmt.Sprintf("aof_current_size:%d", info.AOFCurrentSize),
+		fmt.Sprintf("aof_base_size:%d", info.AOFBaseSize),
+		fmt.Sprintf("aof_buffer_length:%d", info.AOFBufferLength),
+		fmt.Sprintf("aof_rewrite_count:%d", info.AOFRewriteCount),
+	}
+
+	return []byte(strings.Join(lines, "\r\n") + "\r\n")
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func statusString(ok bool) string {
+	if ok {
+		return "ok"
+	}
+	return "err"
 }

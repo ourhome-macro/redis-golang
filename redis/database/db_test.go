@@ -4,6 +4,7 @@ import (
 	"MiddlewareSelf/redis/aof"
 	"context"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -93,6 +94,53 @@ func TestExecMutatesBeforeAppendFails(t *testing.T) {
 	}
 }
 
+func TestInfoPersistenceReportsAOFState(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("k0"), []byte("v0")}); err != nil {
+		t.Fatalf("set failed: %v", err)
+	}
+	if _, err := db.Exec(1, [][]byte{[]byte("SET"), []byte("k1"), []byte("v1")}); err != nil {
+		t.Fatalf("set on db1 failed: %v", err)
+	}
+	if err := db.RewriteAOF(context.Background()); err != nil {
+		t.Fatalf("RewriteAOF failed: %v", err)
+	}
+
+	reply, err := db.Exec(0, [][]byte{[]byte("INFO"), []byte("persistence")})
+	if err != nil {
+		t.Fatalf("INFO persistence failed: %v", err)
+	}
+
+	body, ok := reply.([]byte)
+	if !ok {
+		t.Fatalf("expected bulk bytes from INFO, got %T", reply)
+	}
+	info := parseInfo(string(body))
+
+	if info["aof_enabled"] != "1" {
+		t.Fatalf("expected aof_enabled=1, got %q", info["aof_enabled"])
+	}
+	if info["aof_last_write_status"] != "ok" {
+		t.Fatalf("expected aof_last_write_status=ok, got %q", info["aof_last_write_status"])
+	}
+	if info["aof_last_bgrewrite_status"] != "ok" {
+		t.Fatalf("expected aof_last_bgrewrite_status=ok, got %q", info["aof_last_bgrewrite_status"])
+	}
+	if info["aof_rewrite_count"] != "1" {
+		t.Fatalf("expected aof_rewrite_count=1, got %q", info["aof_rewrite_count"])
+	}
+	if info["rdb_changes_since_last_save"] != "2" {
+		t.Fatalf("expected dirty count 2, got %q", info["rdb_changes_since_last_save"])
+	}
+}
+
 func assertBulkValue(t *testing.T, db *Db, index int, key, want string) {
 	t.Helper()
 
@@ -124,4 +172,19 @@ func chdirTemp(t *testing.T) {
 	t.Cleanup(func() {
 		_ = os.Chdir(wd)
 	})
+}
+
+func parseInfo(raw string) map[string]string {
+	out := make(map[string]string)
+	for _, line := range strings.Split(raw, "\r\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		out[key] = val
+	}
+	return out
 }
