@@ -21,7 +21,8 @@ var (
 )
 
 var commandKeywords = []string{
-	"PING", "AUTH", "SET", "GET", "DEL", "SELECT", "SETWITHTTL", "INFO",
+	"PING", "AUTH", "SET", "GET", "DEL", "SELECT", "SETWITHTTL",
+	"EXPIRE", "PEXPIRE", "TTL", "PTTL", "PERSIST", "INFO",
 	"HELP", "QUIT", "EXIT",
 }
 
@@ -152,6 +153,8 @@ func printHelp() {
 	fmt.Println("  GET mykey")
 	fmt.Println("  DEL mykey")
 	fmt.Println("  SELECT 1")
+	fmt.Println("  EXPIRE mykey 10")
+	fmt.Println("  PTTL mykey")
 	fmt.Println("  INFO persistence")
 	fmt.Println("quote support:")
 	fmt.Println("  SET greeting \"hello world\"")

@@ -324,7 +324,7 @@ func (aof *AOF) shouldAutoRewrite(minSizeBytes int64, growthPercent float64) (cu
 
 func IsWriteCmd(cmd string) bool {
 	switch cmd {
-	case "SET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "SETWITHTTL":
+	case "SET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "PEXPIRE", "PERSIST", "SETWITHTTL":
 		return true
 	}
 	return false

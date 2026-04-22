@@ -24,11 +24,9 @@ type entity struct {
 	key      string
 	value    Value
 	listElem *list.Element
-	expire   int64 //ms
+	expire   int64 // absolute UnixNano, 0 means persistent
 }
 
-// SnapshotItem 是 Dict 快照项。
-// ExpireAtNano 为绝对过期时间（UnixNano），0 表示永不过期。
 type SnapshotItem struct {
 	Key          string
 	Value        Value
@@ -55,41 +53,29 @@ func (d *Dict) Get(key string) (Value, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if v, ok := d.data[key]; ok {
-		//惰性删除
-		if v.expire > 0 && time.Now().UnixNano() > v.expire {
-			d.ll.Remove(v.listElem)
-			delete(d.data, v.key)
-			d.nbytes -= int64(len(v.key)) + int64(v.value.Len())
-			//delete(d.data, key)
-			return nil, false
-		} else {
-			d.ll.MoveToFront(v.listElem)
-			return v.value, true
-		}
+	v, ok := d.getEntityLocked(key, true)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	return v.value, true
 }
 
-func (d *Dict) SetWithTTL(key string, value Value, ttl int64) {
-	//ttl: ms
+func (d *Dict) SetWithTTL(key string, value Value, ttlMillis int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	var expire int64
-	if ttl > 0 {
-		expire = time.Now().UnixNano() + ttl*1e6
-	} else {
-		expire = 0
+
+	expire := int64(0)
+	if ttlMillis > 0 {
+		expire = time.Now().UnixNano() + ttlMillis*1e6
 	}
+
 	if v, ok := d.data[key]; ok {
-		// 已有 Key
 		delta := int64(value.Len() - v.value.Len())
 		d.nbytes += delta
 		v.value = value
-		d.ll.MoveToFront(v.listElem)
 		v.expire = expire
+		d.ll.MoveToFront(v.listElem)
 	} else {
-		// 新增 Key
 		ent := &entity{
 			key:    key,
 			value:  value,
@@ -98,10 +84,10 @@ func (d *Dict) SetWithTTL(key string, value Value, ttl int64) {
 		ent.listElem = d.ll.PushFront(ent)
 		d.data[key] = ent
 		d.nbytes += int64(len(key)) + int64(value.Len())
-		//v.expire = expire
 	}
+
 	for d.capacity > 0 && d.nbytes > d.capacity {
-		d.RemoveOldest()
+		d.removeOldestLocked()
 	}
 }
 
@@ -109,23 +95,78 @@ func (d *Dict) Set(key string, value Value) {
 	d.SetWithTTL(key, value, 0)
 }
 
-func (d *Dict) RemoveOldest() {
-	elem := d.ll.Back()
-	if elem != nil {
-		d.ll.Remove(elem)
-		ent := elem.Value.(*entity)
-		delete(d.data, ent.key)
-		d.nbytes -= int64(len(ent.key)) + int64(ent.value.Len())
+func (d *Dict) Expire(key string, ttlMillis int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	v, ok := d.getEntityLocked(key, true)
+	if !ok {
+		return false
 	}
+	if ttlMillis <= 0 {
+		d.deleteEntityLocked(v)
+		return true
+	}
+
+	v.expire = time.Now().UnixNano() + ttlMillis*1e6
+	return true
+}
+
+func (d *Dict) Persist(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	v, ok := d.getEntityLocked(key, true)
+	if !ok {
+		return false
+	}
+	if v.expire == 0 {
+		return false
+	}
+
+	v.expire = 0
+	return true
+}
+
+func (d *Dict) PTTL(key string) int64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	v, ok := d.getEntityLocked(key, false)
+	if !ok {
+		return -2
+	}
+	if v.expire == 0 {
+		return -1
+	}
+
+	ttlMs := (v.expire - time.Now().UnixNano()) / 1e6
+	if ttlMs < 0 {
+		ttlMs = 0
+	}
+	return ttlMs
+}
+
+func (d *Dict) TTL(key string) int64 {
+	ttlMs := d.PTTL(key)
+	if ttlMs < 0 {
+		return ttlMs
+	}
+	return ttlMs / 1000
+}
+
+func (d *Dict) RemoveOldest() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.removeOldestLocked()
 }
 
 func (d *Dict) Remove(key string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
 	if v, ok := d.data[key]; ok {
-		d.ll.Remove(v.listElem)
-		delete(d.data, v.key)
-		d.nbytes -= int64(len(v.key)) + int64(v.value.Len())
+		d.deleteEntityLocked(v)
 	}
 }
 
@@ -143,12 +184,7 @@ func (d *Dict) Clear() {
 	d.nbytes = 0
 }
 
-// Snapshot 返回当前字典的只读快照切片。
-//
-// 并发说明：
-// - C 版 Redis 在 fork 后由子进程基于 COW 读取“时间点快照”；
-// - Go 里没有直接 fork+COW 语义，这里通过 RLock 在短临界区复制索引项，
-//   后续重写线程使用复制出来的切片，避免长时间阻塞主线程写请求。
+// Snapshot returns a read-only snapshot for AOF rewrite.
 func (d *Dict) Snapshot() []SnapshotItem {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -156,7 +192,6 @@ func (d *Dict) Snapshot() []SnapshotItem {
 	now := time.Now().UnixNano()
 	items := make([]SnapshotItem, 0, len(d.data))
 	for _, ent := range d.data {
-		// 跳过已经过期的数据
 		if ent.expire > 0 && now > ent.expire {
 			continue
 		}
@@ -168,4 +203,34 @@ func (d *Dict) Snapshot() []SnapshotItem {
 	}
 
 	return items
+}
+
+func (d *Dict) getEntityLocked(key string, touch bool) (*entity, bool) {
+	v, ok := d.data[key]
+	if !ok {
+		return nil, false
+	}
+	if v.expire > 0 && time.Now().UnixNano() > v.expire {
+		d.deleteEntityLocked(v)
+		return nil, false
+	}
+	if touch {
+		d.ll.MoveToFront(v.listElem)
+	}
+	return v, true
+}
+
+func (d *Dict) deleteEntityLocked(v *entity) {
+	d.ll.Remove(v.listElem)
+	delete(d.data, v.key)
+	d.nbytes -= int64(len(v.key)) + int64(v.value.Len())
+}
+
+func (d *Dict) removeOldestLocked() {
+	elem := d.ll.Back()
+	if elem == nil {
+		return
+	}
+	ent := elem.Value.(*entity)
+	d.deleteEntityLocked(ent)
 }

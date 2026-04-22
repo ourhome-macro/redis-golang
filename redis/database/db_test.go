@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAOFReplayKeepsDatabaseIndex(t *testing.T) {
@@ -141,6 +142,78 @@ func TestInfoPersistenceReportsAOFState(t *testing.T) {
 	}
 }
 
+func TestExpireCommands(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	assertIntegerReply(t, db, 0, []string{"TTL", "missing"}, -2)
+	assertIntegerReply(t, db, 0, []string{"PTTL", "missing"}, -2)
+	assertIntegerReply(t, db, 0, []string{"EXPIRE", "missing", "10"}, 0)
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("key"), []byte("value")}); err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+
+	assertIntegerReply(t, db, 0, []string{"TTL", "key"}, -1)
+	assertIntegerReply(t, db, 0, []string{"PERSIST", "key"}, 0)
+	assertIntegerReply(t, db, 0, []string{"EXPIRE", "key", "10"}, 1)
+
+	ttl := mustIntegerReply(t, db, 0, []string{"TTL", "key"})
+	if ttl < 0 || ttl > 10 {
+		t.Fatalf("TTL expected between 0 and 10, got %d", ttl)
+	}
+	pttl := mustIntegerReply(t, db, 0, []string{"PTTL", "key"})
+	if pttl <= 0 || pttl > 10000 {
+		t.Fatalf("PTTL expected between 1 and 10000, got %d", pttl)
+	}
+
+	assertIntegerReply(t, db, 0, []string{"PERSIST", "key"}, 1)
+	assertIntegerReply(t, db, 0, []string{"TTL", "key"}, -1)
+	assertIntegerReply(t, db, 0, []string{"PERSIST", "key"}, 0)
+
+	assertIntegerReply(t, db, 0, []string{"PEXPIRE", "key", "50"}, 1)
+	time.Sleep(80 * time.Millisecond)
+	assertIntegerReply(t, db, 0, []string{"PTTL", "key"}, -2)
+
+	reply, err := db.Exec(0, [][]byte{[]byte("GET"), []byte("key")})
+	if err != nil {
+		t.Fatalf("GET after expiration failed: %v", err)
+	}
+	if reply != nil {
+		t.Fatalf("expected expired key to be removed, got %q", reply)
+	}
+}
+
+func TestExpireReplaySurvivesRestart(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("session"), []byte("alive")}); err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIRE"), []byte("session"), []byte("5000")}); err != nil {
+		t.Fatalf("PEXPIRE failed: %v", err)
+	}
+
+	db.Close()
+
+	reloaded := MakeDbs()
+	defer reloaded.Close()
+
+	pttl := mustIntegerReply(t, reloaded, 0, []string{"PTTL", "session"})
+	if pttl <= 0 || pttl > 5000 {
+		t.Fatalf("expected replayed PTTL between 1 and 5000, got %d", pttl)
+	}
+
+	assertBulkValue(t, reloaded, 0, "session", "alive")
+}
+
 func assertBulkValue(t *testing.T, db *Db, index int, key, want string) {
 	t.Helper()
 
@@ -155,6 +228,37 @@ func assertBulkValue(t *testing.T, db *Db, index int, key, want string) {
 	}
 	if string(got) != want {
 		t.Fatalf("GET %s on db %d expected %q, got %q", key, index, want, string(got))
+	}
+}
+
+func assertIntegerReply(t *testing.T, db *Db, index int, args []string, want int64) {
+	t.Helper()
+	if got := mustIntegerReply(t, db, index, args); got != want {
+		t.Fatalf("%s expected %d, got %d", strings.Join(args, " "), want, got)
+	}
+}
+
+func mustIntegerReply(t *testing.T, db *Db, index int, args []string) int64 {
+	t.Helper()
+
+	bargs := make([][]byte, 0, len(args))
+	for _, arg := range args {
+		bargs = append(bargs, []byte(arg))
+	}
+
+	reply, err := db.Exec(index, bargs)
+	if err != nil {
+		t.Fatalf("%s failed: %v", strings.Join(args, " "), err)
+	}
+
+	switch v := reply.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	default:
+		t.Fatalf("%s expected integer reply, got %T", strings.Join(args, " "), reply)
+		return 0
 	}
 }
 

@@ -283,6 +283,88 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 			},
 		}, nil
 
+	case "EXPIRE":
+		if len(args) != 3 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'expire'")
+		}
+
+		key := string(args[1])
+		ttlSec, err := strconv.ParseInt(string(args[2]), 10, 64)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid expire time")
+		}
+
+		return commandPlan{
+			write: true,
+			exec: func() (interface{}, error) {
+				if dict.Expire(key, ttlSec*1000) {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			},
+		}, nil
+
+	case "PEXPIRE":
+		if len(args) != 3 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'pexpire'")
+		}
+
+		key := string(args[1])
+		ttlMs, err := strconv.ParseInt(string(args[2]), 10, 64)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid expire time")
+		}
+
+		return commandPlan{
+			write: true,
+			exec: func() (interface{}, error) {
+				if dict.Expire(key, ttlMs) {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			},
+		}, nil
+
+	case "TTL":
+		if len(args) != 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'ttl'")
+		}
+
+		key := string(args[1])
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				return dict.TTL(key), nil
+			},
+		}, nil
+
+	case "PTTL":
+		if len(args) != 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'pttl'")
+		}
+
+		key := string(args[1])
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				return dict.PTTL(key), nil
+			},
+		}, nil
+
+	case "PERSIST":
+		if len(args) != 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'persist'")
+		}
+
+		key := string(args[1])
+		return commandPlan{
+			write: true,
+			exec: func() (interface{}, error) {
+				if dict.Persist(key) {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			},
+		}, nil
+
 	case "GET":
 		if len(args) != 2 {
 			return commandPlan{}, errors.New("wrong number of arguments for 'get'")
