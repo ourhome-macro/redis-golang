@@ -52,7 +52,7 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 	start := time.Now()
 	log.Printf("[AOF-REWRITE] start, file=%s", aof.fileName)
 
-	tmpPath := filepath.Join(filepath.Dir(aof.fileName), RewriteTempName)
+	tmpPath := rewriteTempPath(aof.fileName)
 	_ = os.Remove(tmpPath)
 	childDone := make(chan rewriteChildResult, 1)
 
@@ -63,6 +63,10 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 			childDone <- rewriteChildResult{err: fmt.Errorf("snapshot failed: %w", err)}
 			return
 		}
+		if err := ctx.Err(); err != nil {
+			childDone <- rewriteChildResult{err: fmt.Errorf("rewrite canceled before temp write: %w", err)}
+			return
+		}
 
 		tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 		if err != nil {
@@ -71,6 +75,12 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 		}
 
 		for i, cmd := range snapshot {
+			if err := ctx.Err(); err != nil {
+				_ = tmpFile.Close()
+				_ = os.Remove(tmpPath)
+				childDone <- rewriteChildResult{err: fmt.Errorf("rewrite canceled during temp write: %w", err)}
+				return
+			}
 			if len(cmd.Args) == 0 {
 				continue
 			}
@@ -138,6 +148,14 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 		return fmt.Errorf("open temp file for append failed: %w", err)
 	}
 	for i, cmd := range aof.rewriteBuffer {
+		if err := ctx.Err(); err != nil {
+			_ = appendFile.Close()
+			_ = os.Remove(tmpPath)
+			aof.lastRewriteOK = false
+			aof.lastRewriteAt = time.Now()
+			aof.lastRewriteMs = time.Since(start).Milliseconds()
+			return fmt.Errorf("rewrite canceled during incremental merge: %w", err)
+		}
 		if _, err := appendFile.Write(cmd); err != nil {
 			_ = appendFile.Close()
 			_ = os.Remove(tmpPath)
@@ -189,6 +207,13 @@ func (aof *AOF) Rewrite(ctx context.Context) error {
 
 	log.Printf("[AOF-REWRITE] done, cost=%s", time.Since(start))
 	return nil
+}
+
+func rewriteTempPath(finalPath string) string {
+	return filepath.Join(
+		filepath.Dir(finalPath),
+		fmt.Sprintf("%s.%d.%d", RewriteTempName, os.Getpid(), time.Now().UnixNano()),
+	)
 }
 
 func replaceAOFFile(tmpPath, finalPath string) error {

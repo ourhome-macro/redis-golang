@@ -9,16 +9,25 @@ import (
 	"io"
 	"os"
 	"strconv"
-	//"strings"
+)
+
+const (
+	MaxBulkLength  int64 = 512 * 1024 * 1024
+	MaxArrayLength int64 = 1024 * 1024
+
+	maxLineLength   = 64 * 1024
+	arrayInitialCap = 16
+)
+
+var (
+	errLineTooLarge = errors.New("protocol line too large")
+	errMissingCRLF  = errors.New("missing CRLF")
 )
 
 type Payload struct {
 	Data _interface.Reply
 	Err  error
 }
-
-//resp解析器
-//＋ - ERROR . $ *
 
 func ParseStream(reader io.Reader) <-chan *Payload {
 	ch := make(chan *Payload)
@@ -30,34 +39,23 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 	defer close(ch)
 	reader := bufio.NewReader(rawReader)
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := readLine(reader)
 		if err != nil {
-			if err == io.EOF {
-				ch <- &Payload{Err: errors.New("EOF")}
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				ch <- &Payload{Err: errors.New("os.ErrDeadlineExceeded")}
-			}
-			//close(ch)
+			emitReadError(ch, err)
 			return
 		}
-		line = bytes.TrimSuffix(line, []byte{'\r', '\n'})
 		if len(line) == 0 {
 			ch <- &Payload{Err: errors.New("empty line")}
 			continue
 		}
 		switch line[0] {
 		case '+':
-			content := string(line[1:])
-			//content = string(content)
 			ch <- &Payload{
-				Data: resp.MakeSimpleReply(content),
+				Data: resp.MakeSimpleReply(string(line[1:])),
 			}
 		case '-':
-			content := string(line[1:])
-			//content = string(content)
 			ch <- &Payload{
-				Data: resp.MakeErrorReply(content),
+				Data: resp.MakeErrorReply(string(line[1:])),
 			}
 		case ':':
 			content, err := strconv.ParseInt(string(line[1:]), 10, 64)
@@ -69,104 +67,155 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 				Data: resp.MakeIntegerReply(content),
 			}
 		case '$':
-			parseBulk(reader, ch, line)
+			if !parseBulk(reader, ch, line) {
+				return
+			}
 		case '*':
-			parseArray(reader, ch, line)
+			if !parseArray(reader, ch, line) {
+				return
+			}
 		default:
 			ch <- &Payload{Err: errors.New("error pattern.please write again")}
 		}
 	}
 }
 
-func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) {
+func readLine(reader *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(fragment) > 0 {
+			if len(line)+len(fragment) > maxLineLength {
+				return nil, errLineTooLarge
+			}
+			line = append(line, fragment...)
+		}
+		if err == nil {
+			return bytes.TrimSuffix(line, []byte{'\r', '\n'}), nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return nil, err
+	}
+}
+
+func emitReadError(ch chan<- *Payload, err error) {
+	if err == io.EOF {
+		ch <- &Payload{Err: errors.New("EOF")}
+		return
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		ch <- &Payload{Err: errors.New("os.ErrDeadlineExceeded")}
+		return
+	}
+	ch <- &Payload{Err: err}
+}
+
+func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) bool {
 	nStrs, err := strconv.ParseInt(string(header[1:]), 10, 64)
 	if err != nil || nStrs < -1 {
 		ch <- &Payload{Err: errors.New("invalid array format")}
-		return
-	} else if nStrs == -1 {
-		// Null Array
+		return false
+	}
+	if nStrs > MaxArrayLength {
+		ch <- &Payload{Err: errors.New("array length too large")}
+		return false
+	}
+	if nStrs == -1 {
 		ch <- &Payload{
 			Data: resp.MakeArrayReply(nil),
 		}
-		return
-	} else if nStrs == 0 {
-		// Empty Array
+		return true
+	}
+	if nStrs == 0 {
 		ch <- &Payload{
-			Data: resp.MakeArrayReply([][]byte{}), // 空切片
+			Data: resp.MakeArrayReply([][]byte{}),
 		}
-		return
+		return true
 	}
 
-	lines := make([][]byte, 0, int(nStrs))
+	capacity := int(nStrs)
+	if capacity > arrayInitialCap {
+		capacity = arrayInitialCap
+	}
+	lines := make([][]byte, 0, capacity)
 	for i := int64(0); i < nStrs; i++ {
-		line, err := reader.ReadBytes('\n')
+		line, err := readLine(reader)
 		if err != nil {
 			ch <- &Payload{Err: errors.New("invalid array length")}
-			return
+			return false
 		}
-		line = bytes.TrimSuffix(line, []byte{'\r', '\n'})
 
-		// 简单检查格式，必须以 $ 开头
 		if len(line) < 2 || line[0] != '$' {
 			ch <- &Payload{Err: errors.New("invalid array element header")}
-			return
+			return false
 		}
 
-		strLenStr := string(line[1:])
-		strLen, err := strconv.ParseInt(strLenStr, 10, 64)
-
+		strLen, err := strconv.ParseInt(string(line[1:]), 10, 64)
 		if err != nil || strLen < -1 {
 			ch <- &Payload{Err: errors.New("invalid array bulk length")}
-			return
+			return false
+		}
+		if strLen > MaxBulkLength {
+			ch <- &Payload{Err: errors.New("array bulk length too large")}
+			return false
 		}
 
 		if strLen == -1 {
 			lines = append(lines, nil)
-		} else {
-			body := make([]byte, strLen+2)
-			_, err := io.ReadFull(reader, body)
-			if err != nil {
-				ch <- &Payload{Err: errors.New("invalid array parse")}
-				return
-			}
-			if !bytes.HasSuffix(body, []byte{'\r', '\n'}) {
-				ch <- &Payload{Err: errors.New("invalid array parse: missing CRLF")}
-				return
-			}
-			lines = append(lines, body[:strLen])
+			continue
 		}
+
+		body, err := readBulkBody(reader, int(strLen))
+		if err != nil {
+			ch <- &Payload{Err: errors.New("invalid array parse")}
+			return false
+		}
+		lines = append(lines, body)
 	}
 	ch <- &Payload{
 		Data: resp.MakeArrayReply(lines),
 	}
+	return true
 }
 
-func parseBulk(reader *bufio.Reader, ch chan *Payload, line []byte) {
+func parseBulk(reader *bufio.Reader, ch chan<- *Payload, line []byte) bool {
 	strlen, err := strconv.ParseInt(string(line[1:]), 10, 64)
-	if err != nil {
-		ch <- &Payload{Err: errors.New("$$invalid parseInt")}
-		return
+	if err != nil || strlen < -1 {
+		ch <- &Payload{Err: errors.New("invalid bulk length")}
+		return false
+	}
+	if strlen > MaxBulkLength {
+		ch <- &Payload{Err: errors.New("bulk string too large")}
+		return false
 	}
 
 	if strlen == -1 {
 		ch <- &Payload{
-			Data: resp.MakeBulkReply(nil), // 返回 Null
+			Data: resp.MakeBulkReply(nil),
 		}
-		return
+		return true
 	}
 
-	strBuf := make([]byte, strlen+2)
-	_, err = io.ReadFull(reader, strBuf)
+	strBuf, err := readBulkBody(reader, int(strlen))
 	if err != nil {
 		ch <- &Payload{Err: errors.New("invalid bulk parse")}
-		//close(ch)
-		return
-	}
-	if !bytes.HasSuffix(strBuf, []byte{'\r', '\n'}) {
-		ch <- &Payload{Err: errors.New("invalid bulk parse: missing CRLF")}
-		return
+		return false
 	}
 	ch <- &Payload{
-		Data: resp.MakeBulkReply(strBuf[:strlen]),
+		Data: resp.MakeBulkReply(strBuf),
 	}
+	return true
+}
+
+func readBulkBody(reader *bufio.Reader, length int) ([]byte, error) {
+	body := make([]byte, length+2)
+	if _, err := io.ReadFull(reader, body); err != nil {
+		return nil, err
+	}
+	if !bytes.HasSuffix(body, []byte{'\r', '\n'}) {
+		return nil, errMissingCRLF
+	}
+	return body[:length], nil
 }

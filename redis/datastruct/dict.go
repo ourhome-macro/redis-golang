@@ -61,25 +61,35 @@ func (d *Dict) Get(key string) (Value, bool) {
 }
 
 func (d *Dict) SetWithTTL(key string, value Value, ttlMillis int64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	expire := int64(0)
 	if ttlMillis > 0 {
 		expire = time.Now().UnixNano() + ttlMillis*1e6
+	}
+	d.SetWithExpireAt(key, value, expire)
+}
+
+func (d *Dict) SetWithExpireAt(key string, value Value, expireAtNano int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if expireAtNano > 0 && time.Now().UnixNano() >= expireAtNano {
+		if v, ok := d.data[key]; ok {
+			d.deleteEntityLocked(v)
+		}
+		return
 	}
 
 	if v, ok := d.data[key]; ok {
 		delta := int64(value.Len() - v.value.Len())
 		d.nbytes += delta
 		v.value = value
-		v.expire = expire
+		v.expire = expireAtNano
 		d.ll.MoveToFront(v.listElem)
 	} else {
 		ent := &entity{
 			key:    key,
 			value:  value,
-			expire: expire,
+			expire: expireAtNano,
 		}
 		ent.listElem = d.ll.PushFront(ent)
 		d.data[key] = ent
@@ -96,6 +106,13 @@ func (d *Dict) Set(key string, value Value) {
 }
 
 func (d *Dict) Expire(key string, ttlMillis int64) bool {
+	if ttlMillis <= 0 {
+		return d.ExpireAt(key, time.Now().UnixNano())
+	}
+	return d.ExpireAt(key, time.Now().UnixNano()+ttlMillis*1e6)
+}
+
+func (d *Dict) ExpireAt(key string, expireAtNano int64) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -103,12 +120,12 @@ func (d *Dict) Expire(key string, ttlMillis int64) bool {
 	if !ok {
 		return false
 	}
-	if ttlMillis <= 0 {
+	if expireAtNano <= time.Now().UnixNano() {
 		d.deleteEntityLocked(v)
 		return true
 	}
 
-	v.expire = time.Now().UnixNano() + ttlMillis*1e6
+	v.expire = expireAtNano
 	return true
 }
 
@@ -182,6 +199,39 @@ func (d *Dict) Clear() {
 	d.data = make(map[string]*entity)
 	d.ll.Init()
 	d.nbytes = 0
+}
+
+func (d *Dict) PreviewSetEvictions(key string, valueLen int) []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.capacity <= 0 {
+		return nil
+	}
+
+	nextBytes := d.nbytes
+	if ent, ok := d.data[key]; ok {
+		nextBytes += int64(valueLen - ent.value.Len())
+	} else {
+		nextBytes += int64(len(key)) + int64(valueLen)
+	}
+	if nextBytes <= d.capacity {
+		return nil
+	}
+
+	evicted := make([]string, 0)
+	for elem := d.ll.Back(); elem != nil && nextBytes > d.capacity; elem = elem.Prev() {
+		ent := elem.Value.(*entity)
+		if ent.key == key {
+			continue
+		}
+		evicted = append(evicted, ent.key)
+		nextBytes -= int64(len(ent.key)) + int64(ent.value.Len())
+	}
+	if nextBytes > d.capacity {
+		evicted = append(evicted, key)
+	}
+	return evicted
 }
 
 // Snapshot returns a read-only snapshot for AOF rewrite.

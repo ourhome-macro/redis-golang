@@ -141,8 +141,17 @@ func (aof *AOF) SetSnapshotProvider(provider SnapshotProvider) {
 // AppendCommand appends a write command to the live AOF stream.
 // Like Redis, the DB selector is emitted only when the selected DB changes.
 func (aof *AOF) AppendCommand(dbIndex int, args [][]byte) error {
-	if len(args) == 0 {
-		return fmt.Errorf("empty command args")
+	return aof.AppendCommands(dbIndex, [][][]byte{args})
+}
+
+func (aof *AOF) AppendCommands(dbIndex int, commands [][][]byte) error {
+	if len(commands) == 0 {
+		return nil
+	}
+	for _, args := range commands {
+		if len(args) == 0 {
+			return fmt.Errorf("empty command args")
+		}
 	}
 	if dbIndex < 0 {
 		return fmt.Errorf("invalid db index %d", dbIndex)
@@ -151,32 +160,39 @@ func (aof *AOF) AppendCommand(dbIndex int, args [][]byte) error {
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
 
-	encoded := aof.encodeEntryLocked(dbIndex, args, false)
+	oldCurrentDB := aof.currentDB
+	encoded := make([]byte, 0)
+	for _, args := range commands {
+		encoded = append(encoded, aof.encodeEntryLocked(dbIndex, args, false)...)
+	}
 	if _, err := aof.bufWriter.Write(encoded); err != nil {
+		aof.currentDB = oldCurrentDB
+		aof.setLastWriteErrLocked(err)
+		return err
+	}
+
+	if err := aof.bufWriter.Flush(); err != nil {
+		aof.currentDB = oldCurrentDB
 		aof.setLastWriteErrLocked(err)
 		return err
 	}
 
 	switch aof.syncPolicy {
 	case SyncAlways:
-		if err := aof.bufWriter.Flush(); err != nil {
-			aof.setLastWriteErrLocked(err)
-			return err
-		}
 		if err := aof.File.Sync(); err != nil {
 			aof.setLastWriteErrLocked(err)
 			return err
 		}
-		aof.setLastWriteErrLocked(nil)
-	case SyncEverySec, SyncNo:
-		aof.setLastWriteErrLocked(nil)
 	}
+	aof.setLastWriteErrLocked(nil)
 
 	if aof.rewriting {
-		rewriteEncoded := aof.encodeEntryLocked(dbIndex, args, true)
-		cmdCopy := make([]byte, len(rewriteEncoded))
-		copy(cmdCopy, rewriteEncoded)
-		aof.rewriteBuffer = append(aof.rewriteBuffer, cmdCopy)
+		for _, args := range commands {
+			rewriteEncoded := aof.encodeEntryLocked(dbIndex, args, true)
+			cmdCopy := make([]byte, len(rewriteEncoded))
+			copy(cmdCopy, rewriteEncoded)
+			aof.rewriteBuffer = append(aof.rewriteBuffer, cmdCopy)
+		}
 	}
 
 	return nil
@@ -324,7 +340,7 @@ func (aof *AOF) shouldAutoRewrite(minSizeBytes int64, growthPercent float64) (cu
 
 func IsWriteCmd(cmd string) bool {
 	switch cmd {
-	case "SET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "PEXPIRE", "PERSIST", "SETWITHTTL":
+	case "SET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST", "SETWITHTTL", "SETWITHPXAT":
 		return true
 	}
 	return false

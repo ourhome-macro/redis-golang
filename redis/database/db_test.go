@@ -2,8 +2,10 @@ package database
 
 import (
 	"MiddlewareSelf/redis/aof"
+	"MiddlewareSelf/redis/datastruct"
 	"context"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -61,7 +63,7 @@ func TestRewriteKeepsDatabaseIndex(t *testing.T) {
 	assertBulkValue(t, reloaded, 2, "k2", "v2")
 }
 
-func TestExecMutatesBeforeAppendFails(t *testing.T) {
+func TestExecDoesNotMutateWhenAppendFails(t *testing.T) {
 	chdirTemp(t)
 
 	db := MakeDbs()
@@ -82,12 +84,8 @@ func TestExecMutatesBeforeAppendFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after failed set returned error: %v", err)
 	}
-	got, ok := reply.([]byte)
-	if !ok {
-		t.Fatalf("expected bulk reply after failed append, got %T", reply)
-	}
-	if string(got) != "v" {
-		t.Fatalf("expected key to stay in memory after failed append, got %q", string(got))
+	if reply != nil {
+		t.Fatalf("expected failed append to leave memory unchanged, got %q", reply)
 	}
 
 	if db.aof.LastWriteError() == nil {
@@ -197,21 +195,117 @@ func TestExpireReplaySurvivesRestart(t *testing.T) {
 	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("session"), []byte("alive")}); err != nil {
 		t.Fatalf("SET failed: %v", err)
 	}
-	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIRE"), []byte("session"), []byte("5000")}); err != nil {
+	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIRE"), []byte("session"), []byte("300")}); err != nil {
 		t.Fatalf("PEXPIRE failed: %v", err)
 	}
 
 	db.Close()
+	time.Sleep(120 * time.Millisecond)
 
 	reloaded := MakeDbs()
 	defer reloaded.Close()
 
 	pttl := mustIntegerReply(t, reloaded, 0, []string{"PTTL", "session"})
-	if pttl <= 0 || pttl > 5000 {
-		t.Fatalf("expected replayed PTTL between 1 and 5000, got %d", pttl)
+	if pttl <= 0 || pttl > 220 {
+		t.Fatalf("expected replayed PTTL to keep original deadline, got %d", pttl)
 	}
 
 	assertBulkValue(t, reloaded, 0, "session", "alive")
+}
+
+func TestAOFUsesAbsoluteExpireCommands(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("session"), []byte("alive")}); err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIRE"), []byte("session"), []byte("5000")}); err != nil {
+		t.Fatalf("PEXPIRE failed: %v", err)
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("SETWITHTTL"), []byte("cached"), []byte("value"), []byte("5000")}); err != nil {
+		t.Fatalf("SETWITHTTL failed: %v", err)
+	}
+	db.Close()
+
+	raw, err := os.ReadFile(aof.AofName)
+	if err != nil {
+		t.Fatalf("read aof failed: %v", err)
+	}
+	body := string(raw)
+	if strings.Contains(body, "$7\r\nPEXPIRE\r\n") || strings.Contains(body, "$10\r\nSETWITHTTL\r\n") {
+		t.Fatalf("expected relative expire commands to be canonicalized, got %q", body)
+	}
+	if !strings.Contains(body, "PEXPIREAT") {
+		t.Fatalf("expected PEXPIREAT in AOF, got %q", body)
+	}
+	if !strings.Contains(body, "SETWITHPXAT") {
+		t.Fatalf("expected SETWITHPXAT in AOF, got %q", body)
+	}
+}
+
+func TestExpireRejectsOverflow(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("EXPIRE"), []byte("k"), []byte(strconv.FormatInt(maxInt64, 10))}); err == nil {
+		t.Fatal("expected EXPIRE overflow to fail")
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIRE"), []byte("k"), []byte(strconv.FormatInt(maxInt64, 10))}); err == nil {
+		t.Fatal("expected PEXPIRE overflow to fail")
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIREAT"), []byte("k"), []byte(strconv.FormatInt(maxInt64, 10))}); err == nil {
+		t.Fatal("expected PEXPIREAT overflow to fail")
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("SETWITHPXAT"), []byte("k"), []byte("v"), []byte(strconv.FormatInt(maxInt64, 10))}); err == nil {
+		t.Fatal("expected SETWITHPXAT overflow to fail")
+	}
+}
+
+func TestEvictionIsReplayable(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	db.dicts[0] = datastruct.MakeDictWithCapacity(8)
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("a"), []byte("11")}); err != nil {
+		t.Fatalf("SET a failed: %v", err)
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("b"), []byte("22")}); err != nil {
+		t.Fatalf("SET b failed: %v", err)
+	}
+	assertBulkValue(t, db, 0, "a", "11")
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("c"), []byte("33")}); err != nil {
+		t.Fatalf("SET c failed: %v", err)
+	}
+
+	if reply, err := db.Exec(0, [][]byte{[]byte("GET"), []byte("b")}); err != nil || reply != nil {
+		t.Fatalf("expected b to be evicted, reply=%v err=%v", reply, err)
+	}
+	assertBulkValue(t, db, 0, "a", "11")
+	assertBulkValue(t, db, 0, "c", "33")
+	db.Close()
+
+	reloaded := MakeDbs()
+	defer reloaded.Close()
+
+	if reply, err := reloaded.Exec(0, [][]byte{[]byte("GET"), []byte("b")}); err != nil || reply != nil {
+		t.Fatalf("expected replayed AOF to keep b evicted, reply=%v err=%v", reply, err)
+	}
+	assertBulkValue(t, reloaded, 0, "a", "11")
+	assertBulkValue(t, reloaded, 0, "c", "33")
 }
 
 func assertBulkValue(t *testing.T, db *Db, index int, key, want string) {
