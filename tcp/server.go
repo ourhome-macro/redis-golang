@@ -13,7 +13,6 @@ import (
 	"time"
 )
 
-// Config 做tcp服务器配置
 type Config struct {
 	Address    string        `yaml:"address"`
 	MaxConnect uint32        `yaml:"max-connect"`
@@ -28,7 +27,10 @@ type Handler interface {
 }
 
 func ListenAndServe(listener net.Listener, handler Handler, closeChan <-chan struct{}) {
-	// 监听关闭通知
+	listenAndServe(listener, handler, closeChan, nil)
+}
+
+func listenAndServe(listener net.Listener, handler Handler, closeChan <-chan struct{}, cfg *Config) {
 	go func() {
 		<-closeChan
 		log.Println("close listener")
@@ -37,7 +39,6 @@ func ListenAndServe(listener net.Listener, handler Handler, closeChan <-chan str
 	}()
 
 	defer func() {
-		//atomic.AddInt32(&ClientCounter, -1)
 		_ = listener.Close()
 		_ = handler.Close()
 	}()
@@ -48,17 +49,72 @@ func ListenAndServe(listener net.Listener, handler Handler, closeChan <-chan str
 		if err != nil {
 			break
 		}
-		wait.Add(1)
-		go func() {
+		if !acquireConnection(maxConnections(cfg)) {
+			log.Printf("reject connection from %s: max connections reached", conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
 
-			atomic.AddInt32(&ClientCounter, 1)
+		conn = withReadTimeout(conn, readTimeout(cfg))
+		wait.Add(1)
+		go func(conn net.Conn) {
 			defer atomic.AddInt32(&ClientCounter, -1)
 			defer wait.Done()
 			handler.Handle(context.Background(), conn)
-		}()
-
+		}(conn)
 	}
 	wait.Wait()
+}
+
+func maxConnections(cfg *Config) uint32 {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.MaxConnect
+}
+
+func readTimeout(cfg *Config) time.Duration {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.Timeout
+}
+
+func acquireConnection(max uint32) bool {
+	if max == 0 {
+		atomic.AddInt32(&ClientCounter, 1)
+		return true
+	}
+
+	for {
+		current := atomic.LoadInt32(&ClientCounter)
+		if uint32(current) >= max {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&ClientCounter, current, current+1) {
+			return true
+		}
+	}
+}
+
+type readTimeoutConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func withReadTimeout(conn net.Conn, timeout time.Duration) net.Conn {
+	if timeout <= 0 {
+		return conn
+	}
+	return &readTimeoutConn{
+		Conn:    conn,
+		timeout: timeout,
+	}
+}
+
+func (c *readTimeoutConn) Read(b []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Read(b)
 }
 
 func ListenAndServeWithSignal(cfg *Config, handler Handler) error {
@@ -78,6 +134,6 @@ func ListenAndServeWithSignal(cfg *Config, handler Handler) error {
 		return err
 	}
 	log.Println(fmt.Sprintf("bind: %s, start listening...", cfg.Address))
-	ListenAndServe(listener, handler, closeChan)
+	listenAndServe(listener, handler, closeChan, cfg)
 	return nil
 }

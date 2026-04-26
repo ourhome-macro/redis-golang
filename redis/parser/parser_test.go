@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +75,73 @@ func TestParseStream_Real(t *testing.T) {
 		assertReplyEqual(t, p.Data, resp.MakeArrayReply(nil))
 	} else {
 		t.Fatal("Timeout waiting for Null Array")
+	}
+}
+
+func TestParserRejectsInvalidBulkLengths(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{"top level below null bulk", "$-2\r\n", "invalid bulk length"},
+		{"array element below null bulk", "*1\r\n$-2\r\n", "invalid array bulk length"},
+		{"array below null array", "*-2\r\n", "invalid array format"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertParseErrorContains(t, tt.input, tt.wantErr)
+		})
+	}
+}
+
+func TestParserRejectsOversizedDeclaredLengths(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name:    "top level bulk",
+			input:   fmt.Sprintf("$%d\r\n", MaxBulkLength+1),
+			wantErr: "bulk string too large",
+		},
+		{
+			name:    "array length",
+			input:   fmt.Sprintf("*%d\r\n", MaxArrayLength+1),
+			wantErr: "array length too large",
+		},
+		{
+			name:    "array bulk element",
+			input:   fmt.Sprintf("*1\r\n$%d\r\n", MaxBulkLength+1),
+			wantErr: "array bulk length too large",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertParseErrorContains(t, tt.input, tt.wantErr)
+		})
+	}
+}
+
+func assertParseErrorContains(t *testing.T, input string, want string) {
+	t.Helper()
+
+	ch := ParseStream(strings.NewReader(input))
+	var payload *Payload
+	select {
+	case payload = <-ch:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timeout waiting for parser error")
+	}
+
+	if payload == nil || payload.Err == nil {
+		t.Fatalf("expected parser error containing %q, got payload=%#v", want, payload)
+	}
+	if !strings.Contains(payload.Err.Error(), want) {
+		t.Fatalf("expected parser error containing %q, got %q", want, payload.Err.Error())
 	}
 }
 

@@ -12,22 +12,26 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const MaxNumber = 16
+const maxInt64 = int64(1<<63 - 1)
 
 type Db struct {
 	dicts        []*datastruct.Dict
 	aof          *aof.AOF
+	mu           sync.Mutex
 	dirty        int64
 	lastSaveUnix int64
 }
 
 type commandPlan struct {
-	write bool
-	exec  func() (interface{}, error)
+	write       bool
+	aofCommands [][][]byte
+	exec        func() (interface{}, error)
 }
 
 func MakeDbs() *Db {
@@ -95,9 +99,18 @@ func (db *Db) GetDict(index int) (*datastruct.Dict, error) {
 }
 
 func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	plan, err := db.makeCommandPlan(index, args)
 	if err != nil {
 		return nil, err
+	}
+
+	if plan.write && db.aof != nil {
+		if err := db.aof.AppendCommands(index, plan.aofCommands); err != nil {
+			return nil, err
+		}
 	}
 
 	reply, err := plan.exec()
@@ -106,12 +119,6 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 	}
 	if plan.write {
 		atomic.AddInt64(&db.dirty, 1)
-	}
-
-	if plan.write && db.aof != nil {
-		if err := db.aof.AppendCommand(index, args); err != nil {
-			return reply, err
-		}
 	}
 
 	return reply, nil
@@ -162,11 +169,7 @@ func (db *Db) snapshotForRewrite() ([]aof.RewriteCommand, error) {
 			continue
 		}
 
-		commands = append(commands, aof.RewriteCommand{Args: [][]byte{
-			[]byte("SELECT"),
-			[]byte(strconv.Itoa(dbIndex)),
-		}})
-
+		dbCommands := make([]aof.RewriteCommand, 0, len(items))
 		for _, item := range items {
 			bytesGetter, ok := item.Value.(interface{ Bytes() []byte })
 			if !ok {
@@ -178,25 +181,30 @@ func (db *Db) snapshotForRewrite() ([]aof.RewriteCommand, error) {
 			copy(valCopy, val)
 
 			if item.ExpireAtNano > 0 {
-				ttlMs := (item.ExpireAtNano - now) / 1e6
-				if ttlMs <= 0 {
+				if item.ExpireAtNano <= now {
 					continue
 				}
-				commands = append(commands, aof.RewriteCommand{Args: [][]byte{
-					[]byte("SETWITHTTL"),
+				dbCommands = append(dbCommands, aof.RewriteCommand{Args: makeCommandBytes(
+					[]byte("SETWITHPXAT"),
 					[]byte(item.Key),
 					valCopy,
-					[]byte(strconv.FormatInt(ttlMs, 10)),
-				}})
+					[]byte(strconv.FormatInt(item.ExpireAtNano/1e6, 10)),
+				)})
 				continue
 			}
 
-			commands = append(commands, aof.RewriteCommand{Args: [][]byte{
+			dbCommands = append(dbCommands, aof.RewriteCommand{Args: makeCommandBytes(
 				[]byte("SET"),
 				[]byte(item.Key),
 				valCopy,
-			}})
+			)})
 		}
+		if len(dbCommands) == 0 {
+			continue
+		}
+
+		commands = append(commands, aof.RewriteCommand{Args: makeCommand("SELECT", strconv.Itoa(dbIndex))})
+		commands = append(commands, dbCommands...)
 	}
 
 	return commands, nil
@@ -255,8 +263,10 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
+		aofCommands := db.setAOFCommands(dict, key, value, 0)
 		return commandPlan{
-			write: true,
+			write:       true,
+			aofCommands: aofCommands,
 			exec: func() (interface{}, error) {
 				dict.Set(key, NewDataObject(value))
 				return "OK", nil
@@ -274,11 +284,44 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		if err != nil {
 			return commandPlan{}, errors.New("invalid ttl argument")
 		}
+		if ttl <= 0 {
+			return commandPlan{}, errors.New("invalid ttl argument")
+		}
+		expireAtMs, expireAtNano, err := expireAtFromTTL(ttl)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid ttl argument")
+		}
 
 		return commandPlan{
-			write: true,
+			write:       true,
+			aofCommands: db.setAOFCommands(dict, key, value, expireAtMs),
 			exec: func() (interface{}, error) {
-				dict.SetWithTTL(key, NewDataObject(value), ttl)
+				dict.SetWithExpireAt(key, NewDataObject(value), expireAtNano)
+				return "OK", nil
+			},
+		}, nil
+
+	case "SETWITHPXAT":
+		if len(args) != 4 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'setwithpxat'")
+		}
+
+		key := string(args[1])
+		value := append([]byte(nil), args[2]...)
+		expireAtMs, err := strconv.ParseInt(string(args[3]), 10, 64)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid expire time")
+		}
+		expireAtNano, err := expireAtNanoFromMs(expireAtMs)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid expire time")
+		}
+
+		return commandPlan{
+			write:       true,
+			aofCommands: db.setAOFCommands(dict, key, value, expireAtMs),
+			exec: func() (interface{}, error) {
+				dict.SetWithExpireAt(key, NewDataObject(value), expireAtNano)
 				return "OK", nil
 			},
 		}, nil
@@ -293,11 +336,31 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		if err != nil {
 			return commandPlan{}, errors.New("invalid expire time")
 		}
+		ttlMs := int64(0)
+		expireAtMs := int64(0)
+		expireAtNano := int64(0)
+		if ttlSec > 0 {
+			if ttlSec > maxInt64/1000 {
+				return commandPlan{}, errors.New("invalid expire time")
+			}
+			ttlMs = ttlSec * 1000
+			expireAtMs, expireAtNano, err = expireAtFromTTL(ttlMs)
+			if err != nil {
+				return commandPlan{}, errors.New("invalid expire time")
+			}
+		}
 
 		return commandPlan{
-			write: true,
+			write:       true,
+			aofCommands: expireAOFCommands(key, ttlMs, expireAtMs),
 			exec: func() (interface{}, error) {
-				if dict.Expire(key, ttlSec*1000) {
+				if ttlMs <= 0 {
+					if dict.ExpireAt(key, time.Now().UnixNano()) {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+				if dict.ExpireAt(key, expireAtNano) {
 					return int64(1), nil
 				}
 				return int64(0), nil
@@ -314,11 +377,52 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		if err != nil {
 			return commandPlan{}, errors.New("invalid expire time")
 		}
+		expireAtMs := int64(0)
+		expireAtNano := int64(0)
+		if ttlMs > 0 {
+			expireAtMs, expireAtNano, err = expireAtFromTTL(ttlMs)
+			if err != nil {
+				return commandPlan{}, errors.New("invalid expire time")
+			}
+		}
 
 		return commandPlan{
-			write: true,
+			write:       true,
+			aofCommands: expireAOFCommands(key, ttlMs, expireAtMs),
 			exec: func() (interface{}, error) {
-				if dict.Expire(key, ttlMs) {
+				if ttlMs <= 0 {
+					if dict.ExpireAt(key, time.Now().UnixNano()) {
+						return int64(1), nil
+					}
+					return int64(0), nil
+				}
+				if dict.ExpireAt(key, expireAtNano) {
+					return int64(1), nil
+				}
+				return int64(0), nil
+			},
+		}, nil
+
+	case "PEXPIREAT":
+		if len(args) != 3 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'pexpireat'")
+		}
+
+		key := string(args[1])
+		expireAtMs, err := strconv.ParseInt(string(args[2]), 10, 64)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid expire time")
+		}
+		expireAtNano, err := expireAtNanoFromMs(expireAtMs)
+		if err != nil {
+			return commandPlan{}, errors.New("invalid expire time")
+		}
+
+		return commandPlan{
+			write:       true,
+			aofCommands: [][][]byte{makeCommand("PEXPIREAT", key, strconv.FormatInt(expireAtMs, 10))},
+			exec: func() (interface{}, error) {
+				if dict.ExpireAt(key, expireAtNano) {
 					return int64(1), nil
 				}
 				return int64(0), nil
@@ -356,7 +460,8 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 
 		key := string(args[1])
 		return commandPlan{
-			write: true,
+			write:       true,
+			aofCommands: [][][]byte{makeCommand("PERSIST", key)},
 			exec: func() (interface{}, error) {
 				if dict.Persist(key) {
 					return int64(1), nil
@@ -397,7 +502,8 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write: true,
+			write:       true,
+			aofCommands: [][][]byte{makeCommand(append([]string{"DEL"}, keys...)...)},
 			exec: func() (interface{}, error) {
 				count := 0
 				for _, key := range keys {
@@ -412,6 +518,80 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 	default:
 		return commandPlan{}, fmt.Errorf("unknown command '%s'", cmd)
 	}
+}
+
+func (db *Db) setAOFCommands(dict *datastruct.Dict, key string, value []byte, expireAtMs int64) [][][]byte {
+	var primary [][]byte
+	if expireAtMs > 0 {
+		primary = makeCommandBytes(
+			[]byte("SETWITHPXAT"),
+			[]byte(key),
+			value,
+			[]byte(strconv.FormatInt(expireAtMs, 10)),
+		)
+	} else {
+		primary = makeCommandBytes([]byte("SET"), []byte(key), value)
+	}
+
+	commands := [][][]byte{primary}
+	if expireAtMs > 0 && expireAtMs <= time.Now().UnixMilli() {
+		return commands
+	}
+
+	evicted := dict.PreviewSetEvictions(key, len(value))
+	if len(evicted) == 0 {
+		return commands
+	}
+
+	delArgs := make([]string, 0, len(evicted)+1)
+	delArgs = append(delArgs, "DEL")
+	delArgs = append(delArgs, evicted...)
+	return append(commands, makeCommand(delArgs...))
+}
+
+func expireAOFCommands(key string, ttlMs int64, expireAtMs int64) [][][]byte {
+	if ttlMs <= 0 {
+		return [][][]byte{makeCommand("DEL", key)}
+	}
+	return [][][]byte{makeCommand("PEXPIREAT", key, strconv.FormatInt(expireAtMs, 10))}
+}
+
+func expireAtFromTTL(ttlMs int64) (expireAtMs int64, expireAtNano int64, err error) {
+	nowMs := time.Now().UnixMilli()
+	if ttlMs > maxInt64-nowMs {
+		return 0, 0, errors.New("expire time overflow")
+	}
+	expireAtMs = nowMs + ttlMs
+	expireAtNano, err = expireAtNanoFromMs(expireAtMs)
+	return expireAtMs, expireAtNano, err
+}
+
+func expireAtNanoFromMs(expireAtMs int64) (int64, error) {
+	if expireAtMs <= time.Now().UnixMilli() {
+		return time.Now().UnixNano(), nil
+	}
+	if expireAtMs > maxInt64/1e6 {
+		return 0, errors.New("expire time overflow")
+	}
+	return expireAtMs * 1e6, nil
+}
+
+func makeCommand(args ...string) [][]byte {
+	out := make([][]byte, 0, len(args))
+	for _, arg := range args {
+		out = append(out, []byte(arg))
+	}
+	return out
+}
+
+func makeCommandBytes(args ...[]byte) [][]byte {
+	out := make([][]byte, 0, len(args))
+	for _, arg := range args {
+		argCopy := make([]byte, len(arg))
+		copy(argCopy, arg)
+		out = append(out, argCopy)
+	}
+	return out
 }
 
 func parseSelectIndex(args [][]byte) (int, bool) {

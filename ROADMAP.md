@@ -7,10 +7,11 @@ This file turns the follow-up work into an execution order instead of a vague id
 The project already has:
 
 - TCP server and RESP parsing
-- Basic string commands
+- Basic string and DB commands
+- Expiration command surface: `EXPIRE`, `PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 - AOF persistence and rewrite
 - Pipeline client and a lightweight CLI
-- Basic `INFO persistence`
+- Basic `INFO` / `INFO persistence`
 
 What it does not have yet is the operational and semantic stability needed before distributed work starts.
 
@@ -27,9 +28,9 @@ Target: make one node reliable enough that persistence, expiration, observabilit
 Work items:
 
 1. Expiration semantics
-- Add `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`
-- Add active expiration cycle instead of relying only on lazy deletion
-- Add restart/rewrite tests for expiration correctness
+- Done: command support for `EXPIRE`, `PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
+- Remaining: add active expiration cycle instead of relying only on lazy deletion
+- Remaining: harden restart/rewrite tests for expiration correctness
 
 2. Persistence control
 - Add `BGREWRITEAOF` command
@@ -37,7 +38,7 @@ Work items:
 - Decide how AOF write failure should affect future writes
 
 3. Command and protocol coverage
-- Add `PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`
+- Planned: add `PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`
 - Normalize error replies to be closer to Redis
 - Add more protocol edge-case tests
 
@@ -166,24 +167,24 @@ If the goal is Redis compatibility, skip straight from Phase 2 to Phase 4.
 
 Start with:
 
-1. `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL`
-2. Active expiration cycle
+1. Active expiration cycle
+2. Expiration restart/rewrite correctness hardening
 3. `BGREWRITEAOF`
 
 Reason:
 
 - Expiration is a core Redis behavior and affects memory, persistence, and correctness
-- Active expiration is required before multi-node work
+- The basic expire command surface exists; active cleanup and persistence edge cases are still required before multi-node work
 - `BGREWRITEAOF` completes the current AOF feature line before replication starts
 
 ## Commit-Scale Breakdown
 
 Use small commits with one theme each:
 
-1. Add expire-related commands and tests
-2. Add active expiration cycle and metrics
+1. Add active expiration cycle and metrics
+2. Add restart/rewrite coverage for expiration correctness
 3. Add `BGREWRITEAOF` command and state reporting
 4. Expand `INFO` sections
-5. Start replication handshake
+5. Add planned compatibility commands (`PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`) or start replication handshake
 
 That keeps the project reviewable and lowers rollback cost when semantics need to be corrected.

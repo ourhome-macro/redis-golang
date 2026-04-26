@@ -21,8 +21,8 @@ var (
 )
 
 var commandKeywords = []string{
-	"PING", "AUTH", "SET", "GET", "DEL", "SELECT", "SETWITHTTL",
-	"EXPIRE", "PEXPIRE", "TTL", "PTTL", "PERSIST", "INFO",
+	"SET", "GET", "DEL", "SELECT", "SETWITHTTL", "SETWITHPXAT",
+	"EXPIRE", "PEXPIRE", "PEXPIREAT", "TTL", "PTTL", "PERSIST", "INFO",
 	"HELP", "QUIT", "EXIT",
 }
 
@@ -39,8 +39,8 @@ func main() {
 
 	fmt.Printf("redis-cli-lite connected to %s\n", *addr)
 	fmt.Println("type HELP for usage, EXIT/QUIT to quit")
-	fmt.Println("tip: use ↑/↓ to browse history")
-	fmt.Println("tip: press Tab for command completion, try PING")
+	fmt.Println("tip: use Up/Down to browse history")
+	fmt.Println("tip: press Tab for command completion, try SET")
 
 	lineEditor := liner.NewLiner()
 	defer lineEditor.Close()
@@ -146,16 +146,23 @@ func saveHistory(editor *liner.State, path string) {
 }
 
 func printHelp() {
-	fmt.Println("examples:")
-	fmt.Println("  PING")
-	fmt.Println("  AUTH your-password     # if server supports auth")
-	fmt.Println("  SET mykey hello")
-	fmt.Println("  GET mykey")
-	fmt.Println("  DEL mykey")
-	fmt.Println("  SELECT 1")
-	fmt.Println("  EXPIRE mykey 10")
-	fmt.Println("  PTTL mykey")
-	fmt.Println("  INFO persistence")
+	fmt.Println("server-supported commands:")
+	fmt.Println("  SET key value")
+	fmt.Println("  GET key")
+	fmt.Println("  DEL key [key ...]")
+	fmt.Println("  SELECT index")
+	fmt.Println("  SETWITHTTL key value ttl-ms")
+	fmt.Println("  SETWITHPXAT key value unix-ms")
+	fmt.Println("  EXPIRE key seconds")
+	fmt.Println("  PEXPIRE key milliseconds")
+	fmt.Println("  PEXPIREAT key unix-ms")
+	fmt.Println("  TTL key")
+	fmt.Println("  PTTL key")
+	fmt.Println("  PERSIST key")
+	fmt.Println("  INFO [persistence|all]")
+	fmt.Println("cli commands:")
+	fmt.Println("  HELP")
+	fmt.Println("  EXIT | QUIT")
 	fmt.Println("quote support:")
 	fmt.Println("  SET greeting \"hello world\"")
 	fmt.Println("multi-line support:")

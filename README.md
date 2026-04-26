@@ -10,7 +10,9 @@ See [ROADMAP.md](./ROADMAP.md) for the execution order from single-node hardenin
 
 - TCP Server 主流程（连接管理、优雅关闭）
 - RESP 协议编解码（`+ - : $ *`）
-- 基础命令执行：`SET` / `GET` / `DEL` / `SELECT` / `SETWITHTTL`
+- 基础命令执行：`SET` / `GET` / `DEL` / `SELECT`
+- 过期命令：`SETWITHTTL` / `SETWITHPXAT` / `EXPIRE` / `PEXPIRE` / `PEXPIREAT` / `TTL` / `PTTL` / `PERSIST`
+- 信息命令：`INFO` / `INFO persistence` / `INFO all`
 - 跳表（含 span/rank）：支持插入、删除、按 rank 查询、TopN
 - AOF 持久化：`appendonly.aof`
 - AOF Rewrite（高仿 Redis 思路）：
@@ -68,11 +70,14 @@ go run ./cmd/redis-cli-lite --addr 127.0.0.1:8080 --timeout 3s
 示例命令：
 
 ```text
-PING
 SET name redis-golang
 GET name
+EXPIRE name 30
+TTL name
+PERSIST name
 DEL name
 SELECT 1
+INFO persistence
 ```
 
 ### 3) 运行 Pipeline 示例客户端
@@ -94,6 +99,7 @@ go test ./...
 - RESP 解析边界
 - 跳表 rank/span 逻辑
 - Pipeline 流式收发与第 N 条失败定位
+- 过期命令语义与 AOF 重放/重写保留过期时间
 - AOF Rewrite 增量合并、回滚恢复、自动触发
 
 ---
