@@ -9,6 +9,7 @@ The project already has:
 - TCP server and RESP parsing
 - Basic string and DB commands
 - Expiration command surface: `EXPIRE`, `PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
+- Active expiration cycle with basic `INFO stats` counters
 - AOF persistence and rewrite
 - Pipeline client and a lightweight CLI
 - Basic `INFO` / `INFO persistence`
@@ -29,8 +30,8 @@ Work items:
 
 1. Expiration semantics
 - Done: command support for `EXPIRE`, `PEXPIRE`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
-- Remaining: add active expiration cycle instead of relying only on lazy deletion
-- Remaining: harden restart/rewrite tests for expiration correctness
+- Done: active expiration cycle instead of relying only on lazy deletion
+- Remaining: harden restart/rewrite tests for expiration correctness beyond current coverage
 
 2. Persistence control
 - Add `BGREWRITEAOF` command
@@ -167,23 +168,23 @@ If the goal is Redis compatibility, skip straight from Phase 2 to Phase 4.
 
 Start with:
 
-1. Active expiration cycle
-2. Expiration restart/rewrite correctness hardening
-3. `BGREWRITEAOF`
+1. Expiration restart/rewrite correctness hardening
+2. `BGREWRITEAOF`
+3. Command registry for arity/write/key metadata
 
 Reason:
 
 - Expiration is a core Redis behavior and affects memory, persistence, and correctness
-- The basic expire command surface exists; active cleanup and persistence edge cases are still required before multi-node work
+- The basic expire command surface and active cleanup exist; persistence edge cases should keep expanding before multi-node work
 - `BGREWRITEAOF` completes the current AOF feature line before replication starts
 
 ## Commit-Scale Breakdown
 
 Use small commits with one theme each:
 
-1. Add active expiration cycle and metrics
-2. Add restart/rewrite coverage for expiration correctness
-3. Add `BGREWRITEAOF` command and state reporting
+1. Add restart/rewrite coverage for expiration correctness
+2. Add `BGREWRITEAOF` command and state reporting
+3. Extract command registry for arity/write/key metadata
 4. Expand `INFO` sections
 5. Add planned compatibility commands (`PING`, `ECHO`, `EXISTS`, `MGET`, `MSET`) or start replication handshake
 

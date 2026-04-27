@@ -335,7 +335,8 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	line = bytes.TrimSuffix(line, []byte{'\r', '\n'})
-	return line, nil
+	if !bytes.HasSuffix(line, []byte(resp.CRLF)) {
+		return nil, fmt.Errorf("resp line missing CRLF")
+	}
+	return line[:len(line)-len(resp.CRLF)], nil
 }
-

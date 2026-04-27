@@ -34,21 +34,54 @@ type rewriteChildResult struct {
 // 3) 子协程完成后，主协程将 rewriteBuffer 追加到 temp.aof；
 // 4) 原子 rename(temp.aof -> appendonly.aof)，并重建当前 AOF 句柄。
 func (aof *AOF) Rewrite(ctx context.Context) error {
+	if err := aof.beginRewrite(false); err != nil {
+		return err
+	}
+	return aof.runRewrite(ctx)
+}
+
+func (aof *AOF) RewriteAsync(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if err := aof.beginRewrite(true); err != nil {
+		cancel()
+		return err
+	}
+	go func() {
+		defer aof.rewriteWG.Done()
+		defer cancel()
+		if err := aof.runRewrite(ctx); err != nil {
+			log.Printf("[AOF-REWRITE] background rewrite failed: %v", err)
+		}
+	}()
+	return nil
+}
+
+func (aof *AOF) beginRewrite(trackAsync bool) error {
 	aof.mu.Lock()
+	defer aof.mu.Unlock()
+	if aof.closing {
+		return fmt.Errorf("aof is closing")
+	}
 	if aof.rewriting {
-		aof.mu.Unlock()
 		return fmt.Errorf("rewrite already in progress")
 	}
 	if aof.snapshotProvider == nil {
-		aof.mu.Unlock()
 		return fmt.Errorf("snapshot provider is not set")
 	}
 	aof.rewriting = true
 	aof.rewriteBuffer = aof.rewriteBuffer[:0]
 	aof.rewriteDB = -1
 	aof.rewriteStart = time.Now()
-	aof.mu.Unlock()
+	if trackAsync {
+		aof.rewriteWG.Add(1)
+	}
+	return nil
+}
 
+func (aof *AOF) runRewrite(ctx context.Context) error {
 	start := time.Now()
 	log.Printf("[AOF-REWRITE] start, file=%s", aof.fileName)
 

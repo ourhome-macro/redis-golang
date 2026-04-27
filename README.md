@@ -12,7 +12,8 @@ See [ROADMAP.md](./ROADMAP.md) for the execution order from single-node hardenin
 - RESP 协议编解码（`+ - : $ *`）
 - 基础命令执行：`SET` / `GET` / `DEL` / `SELECT`
 - 过期命令：`SETWITHTTL` / `SETWITHPXAT` / `EXPIRE` / `PEXPIRE` / `PEXPIREAT` / `TTL` / `PTTL` / `PERSIST`
-- 信息命令：`INFO` / `INFO persistence` / `INFO all`
+- 主动过期清理：后台周期性清理过期 key，并在 `INFO stats` 暴露计数
+- 信息命令：`INFO` / `INFO persistence` / `INFO stats` / `INFO all`
 - 跳表（含 span/rank）：支持插入、删除、按 rank 查询、TopN
 - AOF 持久化：`appendonly.aof`
 - AOF Rewrite（高仿 Redis 思路）：
@@ -78,6 +79,7 @@ PERSIST name
 DEL name
 SELECT 1
 INFO persistence
+INFO stats
 ```
 
 ### 3) 运行 Pipeline 示例客户端
@@ -100,6 +102,7 @@ go test ./...
 - 跳表 rank/span 逻辑
 - Pipeline 流式收发与第 N 条失败定位
 - 过期命令语义与 AOF 重放/重写保留过期时间
+- 主动过期清理与 `INFO stats` 指标
 - AOF Rewrite 增量合并、回滚恢复、自动触发
 
 ---
