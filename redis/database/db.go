@@ -289,15 +289,13 @@ func (db *Db) snapshotForRewrite() ([]aof.RewriteCommand, error) {
 }
 
 func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
-	if len(args) == 0 {
-		return commandPlan{}, errors.New("empty command")
+	spec, err := commandSpecForArgs(args)
+	if err != nil {
+		return commandPlan{}, err
 	}
 
-	cmd := strings.ToUpper(string(args[0]))
+	cmd := spec.name
 	if cmd == "PING" {
-		if len(args) > 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'ping'")
-		}
 		if len(args) == 2 {
 			message := append([]byte(nil), args[1]...)
 			return commandPlan{
@@ -313,9 +311,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "ECHO" {
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'echo'")
-		}
 		message := append([]byte(nil), args[1]...)
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -324,9 +319,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "INFO" {
-		if len(args) > 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'info'")
-		}
 		section := "default"
 		if len(args) == 2 {
 			section = strings.ToLower(string(args[1]))
@@ -338,10 +330,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "SELECT" {
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'select'")
-		}
-
 		nextDB, err := strconv.Atoi(string(args[1]))
 		if err != nil {
 			return commandPlan{}, errors.New("invalid index argument")
@@ -357,9 +345,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "BGREWRITEAOF" {
-		if len(args) != 1 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'bgrewriteaof'")
-		}
 		return commandPlan{
 			exec: func() (interface{}, error) {
 				if db.aof == nil {
@@ -380,10 +365,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 
 	switch cmd {
 	case "EXISTS":
-		if len(args) < 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'exists'")
-		}
-
 		keys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
@@ -401,10 +382,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "MGET":
-		if len(args) < 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'mget'")
-		}
-
 		keys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
@@ -429,15 +406,11 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "SET":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'set'")
-		}
-
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
 		aofCommands := db.setAOFCommands(dict, key, value, 0)
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: aofCommands,
 			exec: func() (interface{}, error) {
 				dict.Set(key, NewDataObject(value))
@@ -446,8 +419,8 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "MSET":
-		if len(args) < 3 || len(args)%2 == 0 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'mset'")
+		if len(args)%2 == 0 {
+			return commandPlan{}, spec.arityError()
 		}
 
 		pairs := make([][]byte, 0, len(args)-1)
@@ -456,7 +429,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 		aofArgs := copyCommand(args)
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{aofArgs},
 			exec: func() (interface{}, error) {
 				for i := 0; i < len(pairs); i += 2 {
@@ -469,10 +442,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "SETWITHTTL":
-		if len(args) != 4 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'setwithttl'")
-		}
-
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
 		ttl, err := strconv.ParseInt(string(args[3]), 10, 64)
@@ -488,7 +457,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: db.setAOFCommands(dict, key, value, expireAtMs),
 			exec: func() (interface{}, error) {
 				dict.SetWithExpireAt(key, NewDataObject(value), expireAtNano)
@@ -497,10 +466,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "SETWITHPXAT":
-		if len(args) != 4 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'setwithpxat'")
-		}
-
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
 		expireAtMs, err := strconv.ParseInt(string(args[3]), 10, 64)
@@ -513,7 +478,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: db.setAOFCommands(dict, key, value, expireAtMs),
 			exec: func() (interface{}, error) {
 				dict.SetWithExpireAt(key, NewDataObject(value), expireAtNano)
@@ -522,10 +487,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "EXPIRE":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'expire'")
-		}
-
 		key := string(args[1])
 		ttlSec, err := strconv.ParseInt(string(args[2]), 10, 64)
 		if err != nil {
@@ -549,7 +510,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: expireAOFCommands(key, ttlMs, expireAtMs),
 			exec: func() (interface{}, error) {
 				if ttlMs <= 0 {
@@ -566,10 +527,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PEXPIRE":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'pexpire'")
-		}
-
 		key := string(args[1])
 		ttlMs, err := strconv.ParseInt(string(args[2]), 10, 64)
 		if err != nil {
@@ -588,7 +545,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: expireAOFCommands(key, ttlMs, expireAtMs),
 			exec: func() (interface{}, error) {
 				if ttlMs <= 0 {
@@ -605,10 +562,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PEXPIREAT":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'pexpireat'")
-		}
-
 		key := string(args[1])
 		expireAtMs, err := strconv.ParseInt(string(args[2]), 10, 64)
 		if err != nil {
@@ -623,7 +576,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{makeCommand("PEXPIREAT", key, strconv.FormatInt(expireAtMs, 10))},
 			exec: func() (interface{}, error) {
 				if dict.ExpireAt(key, expireAtNano) {
@@ -634,10 +587,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "TTL":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'ttl'")
-		}
-
 		key := string(args[1])
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -646,10 +595,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PTTL":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'pttl'")
-		}
-
 		key := string(args[1])
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -658,16 +603,12 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PERSIST":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'persist'")
-		}
-
 		key := string(args[1])
 		if !dict.HasExpire(key) {
 			return staticIntegerPlan(0), nil
 		}
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{makeCommand("PERSIST", key)},
 			exec: func() (interface{}, error) {
 				if dict.Persist(key) {
@@ -678,10 +619,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "GET":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'get'")
-		}
-
 		key := string(args[1])
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -699,10 +636,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "DEL":
-		if len(args) < 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'del'")
-		}
-
 		keys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
@@ -713,7 +646,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{makeCommand(append([]string{"DEL"}, existingKeys...)...)},
 			exec: func() (interface{}, error) {
 				for _, key := range existingKeys {
