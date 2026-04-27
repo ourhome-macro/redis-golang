@@ -1,8 +1,8 @@
 package tcp
 
 import (
-	_interface "MiddlewareSelf/redis/interface"
 	"MiddlewareSelf/redis/database"
+	_interface "MiddlewareSelf/redis/interface"
 	"MiddlewareSelf/redis/parser"
 	"MiddlewareSelf/redis/resp"
 	"MiddlewareSelf/util/atomic"
@@ -148,6 +148,8 @@ func (h *RedisHandler) writeReply(client *RedisClient, r _interface.Reply) error
 
 func toReply(v interface{}) _interface.Reply {
 	switch val := v.(type) {
+	case _interface.Reply:
+		return val
 	case nil:
 		return resp.MakeBulkReply(nil)
 	case string:

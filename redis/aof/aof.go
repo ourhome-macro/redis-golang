@@ -38,11 +38,13 @@ type AOF struct {
 	currentDB     int
 	rewriteDB     int
 	lastWriteErr  error
+	closing       bool
 	rewriteStart  time.Time
 	rewriteCount  int64
 	lastRewriteOK bool
 	lastRewriteAt time.Time
 	lastRewriteMs int64
+	rewriteWG     sync.WaitGroup
 
 	snapshotProvider SnapshotProvider
 
@@ -159,6 +161,9 @@ func (aof *AOF) AppendCommands(dbIndex int, commands [][][]byte) error {
 
 	aof.mu.Lock()
 	defer aof.mu.Unlock()
+	if aof.closing {
+		return fmt.Errorf("aof is closing")
+	}
 
 	oldCurrentDB := aof.currentDB
 	encoded := make([]byte, 0)
@@ -199,10 +204,15 @@ func (aof *AOF) AppendCommands(dbIndex int, commands [][][]byte) error {
 }
 
 func (aof *AOF) Close() {
+	aof.mu.Lock()
+	aof.closing = true
+	aof.mu.Unlock()
+
 	aof.closeAutoOnce.Do(func() {
 		close(aof.autoRewriteStop)
 	})
 	aof.autoRewriteWG.Wait()
+	aof.rewriteWG.Wait()
 
 	if aof.syncPolicy == SyncEverySec {
 		aof.closeSyncOnce.Do(func() {
@@ -340,7 +350,7 @@ func (aof *AOF) shouldAutoRewrite(minSizeBytes int64, growthPercent float64) (cu
 
 func IsWriteCmd(cmd string) bool {
 	switch cmd {
-	case "SET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST", "SETWITHTTL", "SETWITHPXAT":
+	case "SET", "MSET", "DEL", "HSET", "LPUSH", "SADD", "EXPIRE", "PEXPIRE", "PEXPIREAT", "PERSIST", "SETWITHTTL", "SETWITHPXAT":
 		return true
 	}
 	return false

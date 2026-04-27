@@ -180,6 +180,7 @@ func TestParser(t *testing.T) {
 		{"empty array", "*0\r\n", false},
 		{"array", "*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n", false},
 		{"array missing crlf", "*1\r\n$5\r\nhelloX\n", true},
+		{"line feed without carriage return", "+OK\n", true},
 		{"invalid format", "invalid\r\n", true},
 		{"incomplete", "+OK", true}, // 缺少\r\n
 	}

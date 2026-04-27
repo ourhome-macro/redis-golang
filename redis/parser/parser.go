@@ -91,7 +91,10 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 			line = append(line, fragment...)
 		}
 		if err == nil {
-			return bytes.TrimSuffix(line, []byte{'\r', '\n'}), nil
+			if !bytes.HasSuffix(line, []byte{'\r', '\n'}) {
+				return nil, errMissingCRLF
+			}
+			return line[:len(line)-2], nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue

@@ -60,6 +60,22 @@ func (d *Dict) Get(key string) (Value, bool) {
 	return v.value, true
 }
 
+func (d *Dict) Exists(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	_, ok := d.getEntityLocked(key, false)
+	return ok
+}
+
+func (d *Dict) HasExpire(key string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	v, ok := d.getEntityLocked(key, false)
+	return ok && v.expire > 0
+}
+
 func (d *Dict) SetWithTTL(key string, value Value, ttlMillis int64) {
 	expire := int64(0)
 	if ttlMillis > 0 {
@@ -199,6 +215,25 @@ func (d *Dict) Clear() {
 	d.data = make(map[string]*entity)
 	d.ll.Init()
 	d.nbytes = 0
+}
+
+func (d *Dict) RemoveExpired(limit int) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now().UnixNano()
+	removed := 0
+	for _, ent := range d.data {
+		if ent.expire == 0 || now < ent.expire {
+			continue
+		}
+		d.deleteEntityLocked(ent)
+		removed++
+		if limit > 0 && removed >= limit {
+			break
+		}
+	}
+	return removed
 }
 
 func (d *Dict) PreviewSetEvictions(key string, valueLen int) []string {

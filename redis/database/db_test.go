@@ -3,6 +3,7 @@ package database
 import (
 	"MiddlewareSelf/redis/aof"
 	"MiddlewareSelf/redis/datastruct"
+	"MiddlewareSelf/redis/resp"
 	"context"
 	"os"
 	"strconv"
@@ -33,6 +34,41 @@ func TestAOFReplayKeepsDatabaseIndex(t *testing.T) {
 
 	assertBulkValue(t, reloaded, 0, "shared", "db0")
 	assertBulkValue(t, reloaded, 1, "shared", "db1")
+}
+
+func TestOpenDbsFailsOnInvalidAOF(t *testing.T) {
+	chdirTemp(t)
+
+	if err := os.WriteFile(aof.AofName, resp.MakeSimpleReply("OK").ToBytes(), 0644); err != nil {
+		t.Fatalf("write invalid aof failed: %v", err)
+	}
+
+	if _, err := OpenDbs(); err == nil {
+		t.Fatal("expected invalid AOF to fail DB open")
+	}
+}
+
+func TestOpenDbsDoesNotLoadLegacyAOFName(t *testing.T) {
+	chdirTemp(t)
+
+	legacy := resp.MakeArrayReply([][]byte{[]byte("SET"), []byte("legacy"), []byte("stale")}).ToBytes()
+	if err := os.WriteFile("redis.aof", legacy, 0644); err != nil {
+		t.Fatalf("write legacy aof failed: %v", err)
+	}
+
+	db, err := OpenDbs()
+	if err != nil {
+		t.Fatalf("OpenDbs failed: %v", err)
+	}
+	defer db.Close()
+
+	reply, err := db.Exec(0, [][]byte{[]byte("GET"), []byte("legacy")})
+	if err != nil {
+		t.Fatalf("GET legacy failed: %v", err)
+	}
+	if reply != nil {
+		t.Fatalf("expected legacy redis.aof to be ignored, got %q", reply)
+	}
 }
 
 func TestRewriteKeepsDatabaseIndex(t *testing.T) {
@@ -137,6 +173,106 @@ func TestInfoPersistenceReportsAOFState(t *testing.T) {
 	}
 	if info["rdb_changes_since_last_save"] != "2" {
 		t.Fatalf("expected dirty count 2, got %q", info["rdb_changes_since_last_save"])
+	}
+}
+
+func TestBasicStandaloneCommandsAndMSetReplay(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+
+	if reply, err := db.Exec(0, [][]byte{[]byte("PING")}); err != nil || reply != "PONG" {
+		t.Fatalf("PING expected PONG, reply=%v err=%v", reply, err)
+	}
+	if reply, err := db.Exec(0, [][]byte{[]byte("PING"), []byte("hello")}); err != nil || string(reply.([]byte)) != "hello" {
+		t.Fatalf("PING message expected bulk hello, reply=%v err=%v", reply, err)
+	}
+	if reply, err := db.Exec(0, [][]byte{[]byte("ECHO"), []byte("world")}); err != nil || string(reply.([]byte)) != "world" {
+		t.Fatalf("ECHO expected world, reply=%v err=%v", reply, err)
+	}
+	if reply, err := db.Exec(0, [][]byte{[]byte("MSET"), []byte("a"), []byte("1"), []byte("b"), []byte("2")}); err != nil || reply != "OK" {
+		t.Fatalf("MSET expected OK, reply=%v err=%v", reply, err)
+	}
+	assertIntegerReply(t, db, 0, []string{"EXISTS", "a", "missing", "a"}, 2)
+
+	reply, err := db.Exec(0, [][]byte{[]byte("MGET"), []byte("a"), []byte("missing"), []byte("b")})
+	if err != nil {
+		t.Fatalf("MGET failed: %v", err)
+	}
+	arr, ok := reply.(*resp.ArrayReply)
+	if !ok {
+		t.Fatalf("MGET expected array reply, got %T", reply)
+	}
+	if len(arr.Args) != 3 || string(arr.Args[0]) != "1" || arr.Args[1] != nil || string(arr.Args[2]) != "2" {
+		t.Fatalf("unexpected MGET args: %#v", arr.Args)
+	}
+
+	db.Close()
+
+	reloaded := MakeDbs()
+	defer reloaded.Close()
+	assertBulkValue(t, reloaded, 0, "a", "1")
+	assertBulkValue(t, reloaded, 0, "b", "2")
+}
+
+func TestBGRewriteAOFCommandStartsRewrite(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("k"), []byte("v")}); err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+	reply, err := db.Exec(0, [][]byte{[]byte("BGREWRITEAOF")})
+	if err != nil {
+		t.Fatalf("BGREWRITEAOF failed: %v", err)
+	}
+	if reply != "Background append only file rewriting started" {
+		t.Fatalf("unexpected BGREWRITEAOF reply: %v", reply)
+	}
+
+	waitUntil(t, 2*time.Second, func() bool {
+		info := db.aof.PersistenceInfo()
+		return info.AOFRewriteCount == 1 && !info.AOFRewriteInProgress
+	})
+	assertBulkValue(t, db, 0, "k", "v")
+}
+
+func TestNoOpWritesDoNotAppendAOFOrDirty(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	if err := db.EnableAOF(aof.SyncAlways); err != nil {
+		t.Fatalf("EnableAOF failed: %v", err)
+	}
+	defer db.Close()
+
+	assertIntegerReply(t, db, 0, []string{"EXPIRE", "missing", "10"}, 0)
+	assertIntegerReply(t, db, 0, []string{"PERSIST", "missing"}, 0)
+	assertIntegerReply(t, db, 0, []string{"DEL", "missing"}, 0)
+
+	reply, err := db.Exec(0, [][]byte{[]byte("INFO"), []byte("persistence")})
+	if err != nil {
+		t.Fatalf("INFO persistence failed: %v", err)
+	}
+	info := parseInfo(string(reply.([]byte)))
+	if info["rdb_changes_since_last_save"] != "0" {
+		t.Fatalf("expected dirty count to stay 0, got %q", info["rdb_changes_since_last_save"])
+	}
+
+	raw, err := os.ReadFile(aof.AofName)
+	if err != nil {
+		t.Fatalf("read aof failed: %v", err)
+	}
+	if len(raw) != 0 {
+		t.Fatalf("expected no-op writes not to append AOF, got %q", raw)
 	}
 }
 
@@ -271,6 +407,84 @@ func TestExpireRejectsOverflow(t *testing.T) {
 	}
 }
 
+func TestActiveExpireLoopRemovesExpiredKeysAndReportsStats(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	if _, err := db.Exec(0, [][]byte{[]byte("SET"), []byte("temp"), []byte("value")}); err != nil {
+		t.Fatalf("SET failed: %v", err)
+	}
+	if _, err := db.Exec(0, [][]byte{[]byte("PEXPIRE"), []byte("temp"), []byte("30")}); err != nil {
+		t.Fatalf("PEXPIRE failed: %v", err)
+	}
+	if db.dicts[0].Len() != 1 {
+		t.Fatalf("expected key to exist before active expiration, got len=%d", db.dicts[0].Len())
+	}
+
+	if err := db.StartActiveExpireLoop(10*time.Millisecond, 100); err != nil {
+		t.Fatalf("StartActiveExpireLoop failed: %v", err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		return db.dicts[0].Len() == 0
+	})
+
+	reply, err := db.Exec(0, [][]byte{[]byte("INFO"), []byte("stats")})
+	if err != nil {
+		t.Fatalf("INFO stats failed: %v", err)
+	}
+	body, ok := reply.([]byte)
+	if !ok {
+		t.Fatalf("expected bulk bytes from INFO stats, got %T", reply)
+	}
+	info := parseInfo(string(body))
+
+	if info["active_expire_running"] != "1" {
+		t.Fatalf("expected active_expire_running=1, got %q", info["active_expire_running"])
+	}
+	if got := mustInfoInt(t, info, "active_expire_cycles"); got <= 0 {
+		t.Fatalf("expected active_expire_cycles > 0, got %d", got)
+	}
+	if got := mustInfoInt(t, info, "active_expired_keys"); got != 1 {
+		t.Fatalf("expected active_expired_keys=1, got %d", got)
+	}
+	if info["active_expire_interval_ms"] != "10" {
+		t.Fatalf("expected active_expire_interval_ms=10, got %q", info["active_expire_interval_ms"])
+	}
+	if info["active_expire_limit_per_db"] != "100" {
+		t.Fatalf("expected active_expire_limit_per_db=100, got %q", info["active_expire_limit_per_db"])
+	}
+}
+
+func TestActiveExpireCycleHonorsLimitPerDB(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	expireAt := time.Now().Add(20 * time.Millisecond).UnixNano()
+	db.dicts[0].SetWithExpireAt("k1", NewDataObject([]byte("v1")), expireAt)
+	db.dicts[0].SetWithExpireAt("k2", NewDataObject([]byte("v2")), expireAt)
+	if db.dicts[0].Len() != 2 {
+		t.Fatalf("expected two expired keys before cycle, got len=%d", db.dicts[0].Len())
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	if got := db.runActiveExpireCycle(1); got != 1 {
+		t.Fatalf("expected first cycle to remove one key, got %d", got)
+	}
+	if db.dicts[0].Len() != 1 {
+		t.Fatalf("expected one key after limited cycle, got len=%d", db.dicts[0].Len())
+	}
+	if got := db.runActiveExpireCycle(1); got != 1 {
+		t.Fatalf("expected second cycle to remove one key, got %d", got)
+	}
+	if db.dicts[0].Len() != 0 {
+		t.Fatalf("expected no keys after second cycle, got len=%d", db.dicts[0].Len())
+	}
+}
+
 func TestEvictionIsReplayable(t *testing.T) {
 	chdirTemp(t)
 
@@ -385,4 +599,31 @@ func parseInfo(raw string) map[string]string {
 		out[key] = val
 	}
 	return out
+}
+
+func mustInfoInt(t *testing.T, info map[string]string, key string) int64 {
+	t.Helper()
+
+	raw, ok := info[key]
+	if !ok {
+		t.Fatalf("missing INFO field %s", key)
+	}
+	val, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		t.Fatalf("parse INFO field %s=%q failed: %v", key, raw, err)
+	}
+	return val
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition was not met before timeout")
 }

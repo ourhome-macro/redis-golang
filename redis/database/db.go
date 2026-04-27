@@ -21,11 +21,20 @@ const MaxNumber = 16
 const maxInt64 = int64(1<<63 - 1)
 
 type Db struct {
-	dicts        []*datastruct.Dict
-	aof          *aof.AOF
-	mu           sync.Mutex
-	dirty        int64
-	lastSaveUnix int64
+	dicts                  []*datastruct.Dict
+	aof                    *aof.AOF
+	mu                     sync.Mutex
+	activeExpireStop       chan struct{}
+	activeExpireWG         sync.WaitGroup
+	closeActiveExpireOnce  sync.Once
+	dirty                  int64
+	lastSaveUnix           int64
+	totalCommands          int64
+	activeExpiredKeys      int64
+	activeExpireCycles     int64
+	activeExpireRunning    int32
+	activeExpireIntervalMs int64
+	activeExpireLimitPerDB int64
 }
 
 type commandPlan struct {
@@ -35,27 +44,38 @@ type commandPlan struct {
 }
 
 func MakeDbs() *Db {
+	db, err := OpenDbs()
+	if err != nil {
+		panic(err)
+	}
+	return db
+}
+
+func OpenDbs() (*Db, error) {
 	dicts := make([]*datastruct.Dict, MaxNumber)
 	for i := 0; i < MaxNumber; i++ {
 		dicts[i] = datastruct.MakeDict()
 	}
 
-	db := &Db{dicts: dicts}
-	loadAOF(db)
+	db := &Db{
+		dicts:            dicts,
+		activeExpireStop: make(chan struct{}),
+	}
+	if err := loadAOF(db); err != nil {
+		return nil, err
+	}
 	atomic.StoreInt64(&db.lastSaveUnix, time.Now().Unix())
-	return db
+	return db, nil
 }
 
-func loadAOF(db *Db) {
+func loadAOF(db *Db) error {
 	path := aof.AofName
 	file, err := os.Open(path)
 	if err != nil {
-		if legacyFile, legacyErr := os.Open("redis.aof"); legacyErr == nil {
-			file = legacyFile
-			path = "redis.aof"
-		} else {
-			return
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
 		}
+		return fmt.Errorf("open AOF %s failed: %w", path, err)
 	}
 	defer file.Close()
 
@@ -71,24 +91,23 @@ func loadAOF(db *Db) {
 			if payload.Err.Error() == "EOF" {
 				break
 			}
-			log.Printf("[DB] skip invalid AOF payload: %v", payload.Err)
-			continue
+			return fmt.Errorf("invalid AOF payload in %s: %w", path, payload.Err)
 		}
 
 		arr, ok := payload.Data.(*resp.ArrayReply)
 		if !ok {
-			continue
+			return fmt.Errorf("invalid AOF entry in %s: expected array command, got %T", path, payload.Data)
 		}
 
-		if _, err := db.Exec(currentDB, arr.Args); err != nil {
-			log.Printf("[DB] replay command failed: %v", err)
-			continue
+		if _, err := db.exec(currentDB, arr.Args, false); err != nil {
+			return fmt.Errorf("replay AOF command %q on db %d failed: %w", commandName(arr.Args), currentDB, err)
 		}
 
 		if nextDB, ok := parseSelectIndex(arr.Args); ok {
 			currentDB = nextDB
 		}
 	}
+	return nil
 }
 
 func (db *Db) GetDict(index int) (*datastruct.Dict, error) {
@@ -99,6 +118,10 @@ func (db *Db) GetDict(index int) (*datastruct.Dict, error) {
 }
 
 func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
+	return db.exec(index, args, true)
+}
+
+func (db *Db) exec(index int, args [][]byte, recordStats bool) (interface{}, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -117,8 +140,11 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if plan.write {
+	if recordStats && plan.write {
 		atomic.AddInt64(&db.dirty, 1)
+	}
+	if recordStats {
+		atomic.AddInt64(&db.totalCommands, 1)
 	}
 
 	return reply, nil
@@ -153,7 +179,59 @@ func (db *Db) StartAutoRewriteLoop(interval time.Duration, minSizeBytes int64, g
 	return nil
 }
 
+func (db *Db) StartActiveExpireLoop(interval time.Duration, limitPerDB int) error {
+	if interval <= 0 {
+		return errors.New("active expire interval must be positive")
+	}
+	if limitPerDB < 0 {
+		return errors.New("active expire limit must not be negative")
+	}
+	if !atomic.CompareAndSwapInt32(&db.activeExpireRunning, 0, 1) {
+		return nil
+	}
+
+	atomic.StoreInt64(&db.activeExpireIntervalMs, interval.Milliseconds())
+	atomic.StoreInt64(&db.activeExpireLimitPerDB, int64(limitPerDB))
+
+	db.activeExpireWG.Add(1)
+	go func() {
+		defer db.activeExpireWG.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-db.activeExpireStop:
+				return
+			case <-ticker.C:
+				db.runActiveExpireCycle(limitPerDB)
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (db *Db) runActiveExpireCycle(limitPerDB int) int {
+	expired := 0
+	for _, dict := range db.dicts {
+		expired += dict.RemoveExpired(limitPerDB)
+	}
+	atomic.AddInt64(&db.activeExpireCycles, 1)
+	if expired > 0 {
+		atomic.AddInt64(&db.activeExpiredKeys, int64(expired))
+	}
+	return expired
+}
+
 func (db *Db) Close() {
+	db.closeActiveExpireOnce.Do(func() {
+		if db.activeExpireStop != nil {
+			close(db.activeExpireStop)
+		}
+		db.activeExpireWG.Wait()
+		atomic.StoreInt32(&db.activeExpireRunning, 0)
+	})
 	if db.aof != nil {
 		db.aof.Close()
 	}
@@ -216,6 +294,35 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 	}
 
 	cmd := strings.ToUpper(string(args[0]))
+	if cmd == "PING" {
+		if len(args) > 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'ping'")
+		}
+		if len(args) == 2 {
+			message := append([]byte(nil), args[1]...)
+			return commandPlan{
+				exec: func() (interface{}, error) {
+					return message, nil
+				},
+			}, nil
+		}
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				return "PONG", nil
+			},
+		}, nil
+	}
+	if cmd == "ECHO" {
+		if len(args) != 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'echo'")
+		}
+		message := append([]byte(nil), args[1]...)
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				return message, nil
+			},
+		}, nil
+	}
 	if cmd == "INFO" {
 		if len(args) > 2 {
 			return commandPlan{}, errors.New("wrong number of arguments for 'info'")
@@ -249,6 +356,22 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 			},
 		}, nil
 	}
+	if cmd == "BGREWRITEAOF" {
+		if len(args) != 1 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'bgrewriteaof'")
+		}
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				if db.aof == nil {
+					return nil, errors.New("aof is not enabled")
+				}
+				if err := db.aof.RewriteAsync(30 * time.Second); err != nil {
+					return nil, err
+				}
+				return "Background append only file rewriting started", nil
+			},
+		}, nil
+	}
 
 	dict, err := db.GetDict(index)
 	if err != nil {
@@ -256,6 +379,55 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 	}
 
 	switch cmd {
+	case "EXISTS":
+		if len(args) < 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'exists'")
+		}
+
+		keys := make([]string, 0, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			keys = append(keys, string(args[i]))
+		}
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				var count int64
+				for _, key := range keys {
+					if _, ok := dict.Get(key); ok {
+						count++
+					}
+				}
+				return count, nil
+			},
+		}, nil
+
+	case "MGET":
+		if len(args) < 2 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'mget'")
+		}
+
+		keys := make([]string, 0, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			keys = append(keys, string(args[i]))
+		}
+		return commandPlan{
+			exec: func() (interface{}, error) {
+				values := make([][]byte, 0, len(keys))
+				for _, key := range keys {
+					val, ok := dict.Get(key)
+					if !ok {
+						values = append(values, nil)
+						continue
+					}
+					dobj, ok := val.(*DataObject)
+					if !ok {
+						return nil, fmt.Errorf("unexpected value type %T", val)
+					}
+					values = append(values, append([]byte(nil), dobj.Bytes()...))
+				}
+				return resp.MakeArrayReply(values), nil
+			},
+		}, nil
+
 	case "SET":
 		if len(args) != 3 {
 			return commandPlan{}, errors.New("wrong number of arguments for 'set'")
@@ -269,6 +441,29 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 			aofCommands: aofCommands,
 			exec: func() (interface{}, error) {
 				dict.Set(key, NewDataObject(value))
+				return "OK", nil
+			},
+		}, nil
+
+	case "MSET":
+		if len(args) < 3 || len(args)%2 == 0 {
+			return commandPlan{}, errors.New("wrong number of arguments for 'mset'")
+		}
+
+		pairs := make([][]byte, 0, len(args)-1)
+		for i := 1; i < len(args); i++ {
+			pairs = append(pairs, append([]byte(nil), args[i]...))
+		}
+		aofArgs := copyCommand(args)
+		return commandPlan{
+			write:       true,
+			aofCommands: [][][]byte{aofArgs},
+			exec: func() (interface{}, error) {
+				for i := 0; i < len(pairs); i += 2 {
+					key := string(pairs[i])
+					value := append([]byte(nil), pairs[i+1]...)
+					dict.Set(key, NewDataObject(value))
+				}
 				return "OK", nil
 			},
 		}, nil
@@ -349,6 +544,9 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 				return commandPlan{}, errors.New("invalid expire time")
 			}
 		}
+		if !dict.Exists(key) {
+			return staticIntegerPlan(0), nil
+		}
 
 		return commandPlan{
 			write:       true,
@@ -385,6 +583,9 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 				return commandPlan{}, errors.New("invalid expire time")
 			}
 		}
+		if !dict.Exists(key) {
+			return staticIntegerPlan(0), nil
+		}
 
 		return commandPlan{
 			write:       true,
@@ -416,6 +617,9 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		expireAtNano, err := expireAtNanoFromMs(expireAtMs)
 		if err != nil {
 			return commandPlan{}, errors.New("invalid expire time")
+		}
+		if !dict.Exists(key) {
+			return staticIntegerPlan(0), nil
 		}
 
 		return commandPlan{
@@ -459,6 +663,9 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		key := string(args[1])
+		if !dict.HasExpire(key) {
+			return staticIntegerPlan(0), nil
+		}
 		return commandPlan{
 			write:       true,
 			aofCommands: [][][]byte{makeCommand("PERSIST", key)},
@@ -500,19 +707,19 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
 		}
+		existingKeys := existingUniqueKeys(dict, keys)
+		if len(existingKeys) == 0 {
+			return staticIntegerPlan(0), nil
+		}
 
 		return commandPlan{
 			write:       true,
-			aofCommands: [][][]byte{makeCommand(append([]string{"DEL"}, keys...)...)},
+			aofCommands: [][][]byte{makeCommand(append([]string{"DEL"}, existingKeys...)...)},
 			exec: func() (interface{}, error) {
-				count := 0
-				for _, key := range keys {
-					if _, ok := dict.Get(key); ok {
-						dict.Remove(key)
-						count++
-					}
+				for _, key := range existingKeys {
+					dict.Remove(key)
 				}
-				return count, nil
+				return len(existingKeys), nil
 			},
 		}, nil
 	default:
@@ -594,6 +801,46 @@ func makeCommandBytes(args ...[]byte) [][]byte {
 	return out
 }
 
+func copyCommand(args [][]byte) [][]byte {
+	out := make([][]byte, 0, len(args))
+	for _, arg := range args {
+		argCopy := make([]byte, len(arg))
+		copy(argCopy, arg)
+		out = append(out, argCopy)
+	}
+	return out
+}
+
+func commandName(args [][]byte) string {
+	if len(args) == 0 {
+		return "<empty>"
+	}
+	return string(args[0])
+}
+
+func staticIntegerPlan(value int64) commandPlan {
+	return commandPlan{
+		exec: func() (interface{}, error) {
+			return value, nil
+		},
+	}
+}
+
+func existingUniqueKeys(dict *datastruct.Dict, keys []string) []string {
+	existing := make([]string, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		if dict.Exists(key) {
+			existing = append(existing, key)
+		}
+	}
+	return existing
+}
+
 func parseSelectIndex(args [][]byte) (int, bool) {
 	if len(args) != 2 {
 		return 0, false
@@ -611,8 +858,12 @@ func parseSelectIndex(args [][]byte) (int, bool) {
 
 func (db *Db) infoReply(section string) ([]byte, error) {
 	switch section {
-	case "default", "all", "persistence":
+	case "default", "all":
+		return joinInfoSections(db.persistenceInfoBytes(), db.statsInfoBytes()), nil
+	case "persistence":
 		return db.persistenceInfoBytes(), nil
+	case "stats":
+		return db.statsInfoBytes(), nil
 	default:
 		return nil, fmt.Errorf("unsupported INFO section '%s'", section)
 	}
@@ -643,6 +894,31 @@ func (db *Db) persistenceInfoBytes() []byte {
 	}
 
 	return []byte(strings.Join(lines, "\r\n") + "\r\n")
+}
+
+func (db *Db) statsInfoBytes() []byte {
+	lines := []string{
+		"# Stats",
+		fmt.Sprintf("total_commands_processed:%d", atomic.LoadInt64(&db.totalCommands)),
+		fmt.Sprintf("active_expire_running:%d", boolToInt(atomic.LoadInt32(&db.activeExpireRunning) == 1)),
+		fmt.Sprintf("active_expire_cycles:%d", atomic.LoadInt64(&db.activeExpireCycles)),
+		fmt.Sprintf("active_expired_keys:%d", atomic.LoadInt64(&db.activeExpiredKeys)),
+		fmt.Sprintf("active_expire_interval_ms:%d", atomic.LoadInt64(&db.activeExpireIntervalMs)),
+		fmt.Sprintf("active_expire_limit_per_db:%d", atomic.LoadInt64(&db.activeExpireLimitPerDB)),
+	}
+
+	return []byte(strings.Join(lines, "\r\n") + "\r\n")
+}
+
+func joinInfoSections(sections ...[]byte) []byte {
+	var b strings.Builder
+	for i, section := range sections {
+		if i > 0 {
+			b.WriteString("\r\n")
+		}
+		b.Write(section)
+	}
+	return []byte(b.String())
 }
 
 func boolToInt(v bool) int {

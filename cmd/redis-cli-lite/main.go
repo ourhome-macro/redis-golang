@@ -2,6 +2,8 @@ package main
 
 import (
 	"MiddlewareSelf/redis/client"
+	"MiddlewareSelf/redis/parser"
+	"MiddlewareSelf/redis/resp"
 	"context"
 	"errors"
 	"flag"
@@ -21,8 +23,8 @@ var (
 )
 
 var commandKeywords = []string{
-	"SET", "GET", "DEL", "SELECT", "SETWITHTTL", "SETWITHPXAT",
-	"EXPIRE", "PEXPIRE", "PEXPIREAT", "TTL", "PTTL", "PERSIST", "INFO",
+	"PING", "ECHO", "SET", "GET", "MGET", "MSET", "DEL", "EXISTS", "SELECT", "SETWITHTTL", "SETWITHPXAT",
+	"EXPIRE", "PEXPIRE", "PEXPIREAT", "TTL", "PTTL", "PERSIST", "INFO", "BGREWRITEAOF",
 	"HELP", "QUIT", "EXIT",
 }
 
@@ -147,9 +149,14 @@ func saveHistory(editor *liner.State, path string) {
 
 func printHelp() {
 	fmt.Println("server-supported commands:")
+	fmt.Println("  PING [message]")
+	fmt.Println("  ECHO message")
 	fmt.Println("  SET key value")
+	fmt.Println("  MSET key value [key value ...]")
 	fmt.Println("  GET key")
+	fmt.Println("  MGET key [key ...]")
 	fmt.Println("  DEL key [key ...]")
+	fmt.Println("  EXISTS key [key ...]")
 	fmt.Println("  SELECT index")
 	fmt.Println("  SETWITHTTL key value ttl-ms")
 	fmt.Println("  SETWITHPXAT key value unix-ms")
@@ -159,7 +166,8 @@ func printHelp() {
 	fmt.Println("  TTL key")
 	fmt.Println("  PTTL key")
 	fmt.Println("  PERSIST key")
-	fmt.Println("  INFO [persistence|all]")
+	fmt.Println("  INFO [persistence|stats|all]")
+	fmt.Println("  BGREWRITEAOF")
 	fmt.Println("cli commands:")
 	fmt.Println("  HELP")
 	fmt.Println("  EXIT | QUIT")
@@ -265,7 +273,35 @@ func formatRESPHuman(raw string) string {
 			return raw
 		}
 		return raw[idx+2 : len(raw)-2]
+	case '*':
+		return formatArrayRESPHuman(raw)
 	default:
 		return strings.TrimSpace(raw)
 	}
+}
+
+func formatArrayRESPHuman(raw string) string {
+	ch := parser.ParseStream(strings.NewReader(raw))
+	payload := <-ch
+	if payload == nil || payload.Err != nil {
+		return strings.TrimSpace(raw)
+	}
+	arr, ok := payload.Data.(*resp.ArrayReply)
+	if !ok {
+		return strings.TrimSpace(raw)
+	}
+
+	var b strings.Builder
+	for i, arg := range arr.Args {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "%d) ", i+1)
+		if arg == nil {
+			b.WriteString("(nil)")
+			continue
+		}
+		b.Write(arg)
+	}
+	return b.String()
 }
