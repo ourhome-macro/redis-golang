@@ -3,6 +3,7 @@ package resp
 import (
 	"bytes"
 	"strconv"
+	"strings"
 )
 
 var (
@@ -32,6 +33,34 @@ type ErrorReply struct {
 func MakeErrorReply(error string) *ErrorReply {
 	return &ErrorReply{
 		Error: error,
+	}
+}
+
+func MakeStandardErrorReply(message string) *ErrorReply {
+	return MakeErrorReply(NormalizeErrorMessage(message))
+}
+
+func NormalizeErrorMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return "ERR"
+	}
+	if hasErrorPrefix(message) {
+		return message
+	}
+	return "ERR " + message
+}
+
+func hasErrorPrefix(message string) bool {
+	prefix := message
+	if idx := strings.IndexByte(message, ' '); idx >= 0 {
+		prefix = message[:idx]
+	}
+	switch prefix {
+	case "ERR", "WRONGTYPE", "NOAUTH", "NOPERM", "BUSY", "NOSCRIPT", "LOADING", "MASTERDOWN", "MISCONF", "OOM", "READONLY", "EXECABORT", "NOREPLICAS":
+		return true
+	default:
+		return false
 	}
 }
 

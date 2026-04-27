@@ -176,6 +176,114 @@ func TestInfoPersistenceReportsAOFState(t *testing.T) {
 	}
 }
 
+func TestInfoServerSectionReportsRuntimeFields(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	reply, err := db.Exec(0, [][]byte{[]byte("INFO"), []byte("server")})
+	if err != nil {
+		t.Fatalf("INFO server failed: %v", err)
+	}
+
+	body, ok := reply.([]byte)
+	if !ok {
+		t.Fatalf("expected bulk bytes from INFO server, got %T", reply)
+	}
+	raw := string(body)
+	if !strings.Contains(raw, "# Server") {
+		t.Fatalf("expected INFO server to contain Server header, got %q", raw)
+	}
+
+	info := parseInfo(raw)
+	if info["server_name"] != "redis-golang" {
+		t.Fatalf("expected server_name=redis-golang, got %q", info["server_name"])
+	}
+	if info["redis_mode"] != "standalone" {
+		t.Fatalf("expected redis_mode=standalone, got %q", info["redis_mode"])
+	}
+	if got := mustInfoInt(t, info, "process_id"); got != int64(os.Getpid()) {
+		t.Fatalf("expected process_id=%d, got %d", os.Getpid(), got)
+	}
+	if info["go_version"] == "" {
+		t.Fatal("expected go_version to be populated")
+	}
+	if got := mustInfoInt(t, info, "arch_bits"); got != int64(strconv.IntSize) {
+		t.Fatalf("expected arch_bits=%d, got %d", strconv.IntSize, got)
+	}
+	if got := mustInfoInt(t, info, "db_count"); got != MaxNumber {
+		t.Fatalf("expected db_count=%d, got %d", MaxNumber, got)
+	}
+	if got := mustInfoInt(t, info, "uptime_in_seconds"); got < 0 {
+		t.Fatalf("expected uptime_in_seconds >= 0, got %d", got)
+	}
+}
+
+func TestInfoReplicationSectionReportsMasterState(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	reply, err := db.Exec(0, [][]byte{[]byte("INFO"), []byte("replication")})
+	if err != nil {
+		t.Fatalf("INFO replication failed: %v", err)
+	}
+
+	body, ok := reply.([]byte)
+	if !ok {
+		t.Fatalf("expected bulk bytes from INFO replication, got %T", reply)
+	}
+
+	info := parseInfo(string(body))
+	if info["role"] != "master" {
+		t.Fatalf("expected role=master, got %q", info["role"])
+	}
+	if info["connected_slaves"] != "0" {
+		t.Fatalf("expected connected_slaves=0, got %q", info["connected_slaves"])
+	}
+	if info["master_replid"] == "" {
+		t.Fatal("expected master_replid to be populated")
+	}
+	if got := mustInfoInt(t, info, "master_repl_offset"); got != 0 {
+		t.Fatalf("expected master_repl_offset=0, got %d", got)
+	}
+	if got := mustInfoInt(t, info, "repl_backlog_active"); got != 1 {
+		t.Fatalf("expected repl_backlog_active=1, got %d", got)
+	}
+}
+
+func TestInfoDefaultIncludesServerSection(t *testing.T) {
+	chdirTemp(t)
+
+	db := MakeDbs()
+	defer db.Close()
+
+	reply, err := db.Exec(0, [][]byte{[]byte("INFO")})
+	if err != nil {
+		t.Fatalf("INFO default failed: %v", err)
+	}
+
+	body, ok := reply.([]byte)
+	if !ok {
+		t.Fatalf("expected bulk bytes from INFO, got %T", reply)
+	}
+	raw := string(body)
+	if !strings.Contains(raw, "# Server") {
+		t.Fatalf("expected INFO default to contain Server section, got %q", raw)
+	}
+	if !strings.Contains(raw, "# Persistence") {
+		t.Fatalf("expected INFO default to contain Persistence section, got %q", raw)
+	}
+	if !strings.Contains(raw, "# Stats") {
+		t.Fatalf("expected INFO default to contain Stats section, got %q", raw)
+	}
+	if !strings.Contains(raw, "# Replication") {
+		t.Fatalf("expected INFO default to contain Replication section, got %q", raw)
+	}
+}
+
 func TestBasicStandaloneCommandsAndMSetReplay(t *testing.T) {
 	chdirTemp(t)
 

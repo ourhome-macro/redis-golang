@@ -52,7 +52,42 @@ See [ROADMAP.md](./ROADMAP.md) for the execution order from single-node hardenin
 go run .
 ```
 
-默认监听地址：`127.0.0.1:8080`（见 `main.go`）。
+Server flags:
+
+```powershell
+go run . --host 127.0.0.1 --port 8080 --maxconn 1000 --timeout 10s
+```
+
+Configuration defaults remain compatible with the previous hard-coded startup:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--addr` | empty | Full `host:port` listen address override. When set, `--host` and `--port` are ignored. |
+| `--host` | `127.0.0.1` | Listen host used when `--addr` is empty. |
+| `--port` | `8080` | Listen port used when `--addr` is empty. |
+| `--maxconn` | `1000` | Maximum concurrent client connections. `0` means unlimited. |
+| `--timeout` | `10s` | Idle read timeout. `0` disables read deadlines. |
+| `--aof-sync` | `everysec` | AOF fsync policy: `always`, `everysec`, or `no`. |
+| `--aof-auto-rewrite` | `true` | Enable automatic AOF rewrite. |
+| `--aof-auto-rewrite-interval` | `2s` | Automatic AOF rewrite check interval. |
+| `--aof-auto-rewrite-min-size` | `1048576` | Minimum AOF size in bytes before automatic rewrite can trigger. |
+| `--aof-auto-rewrite-growth-percent` | `100` | AOF growth percentage required to trigger automatic rewrite. |
+| `--active-expire` | `true` | Enable active expiration loop. |
+| `--active-expire-interval` | `100ms` | Active expiration loop interval. |
+| `--active-expire-limit-per-db` | `1000` | Maximum expired keys removed per DB per cycle. `0` means unlimited. |
+
+Validation rules:
+
+- `--addr` takes precedence over `--host` and `--port`. Both `--addr` and `--host` are trimmed before validation.
+- `--host` must be non-empty when `--addr` is not set. `--port` must stay within `1..65535`.
+- `--maxconn` must stay within `0..4294967295`. `0` still means unlimited.
+- `--timeout` must be `>= 0`. `0` still disables read deadlines.
+- When `--aof-auto-rewrite=true`, `--aof-auto-rewrite-interval` must be `> 0`. If auto rewrite is disabled, the interval is still parsed but not used. `--aof-auto-rewrite-min-size` and `--aof-auto-rewrite-growth-percent` must both be `>= 0`.
+- When `--active-expire=true`, `--active-expire-interval` must be `> 0`. If active expiration is disabled, the interval is still parsed but not used. `--active-expire-limit-per-db` must be `>= 0`, and `0` still means unlimited.
+
+Default listen address remains `127.0.0.1:8080` (see `redis/config/config.go`).
+
+默认监听地址：`127.0.0.1:8080`（见 `redis/config/config.go`）。
 
 ### 2) 启动交互 CLI
 
@@ -141,7 +176,7 @@ go run ./cmd/pipeline-client
 
 ### Q3: 服务端启动报 8080 端口被占用？
 
-A: 停掉占用进程，或修改 `main.go` 中监听端口。
+A: 停掉占用进程，或通过 `--port` / `--addr` 指定其他监听地址。
 
 ---
 

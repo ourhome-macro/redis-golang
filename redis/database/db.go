@@ -8,8 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,10 +22,19 @@ import (
 const MaxNumber = 16
 const maxInt64 = int64(1<<63 - 1)
 
+var (
+	errAOFDisabled           = errors.New("AOF is not enabled")
+	errDBIndexOutOfRange     = errors.New("DB index is out of range")
+	errValueOutOfRange       = errors.New("value is not an integer or out of range")
+	errUnsupportedInfoFormat = "unsupported INFO section '%s'"
+)
+
 type Db struct {
 	dicts                  []*datastruct.Dict
 	aof                    *aof.AOF
+	replication            *replicationState
 	mu                     sync.Mutex
+	startTime              time.Time
 	activeExpireStop       chan struct{}
 	activeExpireWG         sync.WaitGroup
 	closeActiveExpireOnce  sync.Once
@@ -57,14 +68,17 @@ func OpenDbs() (*Db, error) {
 		dicts[i] = datastruct.MakeDict()
 	}
 
+	now := time.Now()
 	db := &Db{
 		dicts:            dicts,
+		replication:      newReplicationState(defaultReplicationBacklogSize),
+		startTime:        now,
 		activeExpireStop: make(chan struct{}),
 	}
 	if err := loadAOF(db); err != nil {
 		return nil, err
 	}
-	atomic.StoreInt64(&db.lastSaveUnix, time.Now().Unix())
+	atomic.StoreInt64(&db.lastSaveUnix, now.Unix())
 	return db, nil
 }
 
@@ -88,7 +102,7 @@ func loadAOF(db *Db) error {
 			continue
 		}
 		if payload.Err != nil {
-			if payload.Err.Error() == "EOF" {
+			if errors.Is(payload.Err, io.EOF) {
 				break
 			}
 			return fmt.Errorf("invalid AOF payload in %s: %w", path, payload.Err)
@@ -112,7 +126,7 @@ func loadAOF(db *Db) error {
 
 func (db *Db) GetDict(index int) (*datastruct.Dict, error) {
 	if index < 0 || index >= MaxNumber {
-		return nil, errors.New("index out of range")
+		return nil, errDBIndexOutOfRange
 	}
 	return db.dicts[index], nil
 }
@@ -123,21 +137,22 @@ func (db *Db) Exec(index int, args [][]byte) (interface{}, error) {
 
 func (db *Db) exec(index int, args [][]byte, recordStats bool) (interface{}, error) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	plan, err := db.makeCommandPlan(index, args)
 	if err != nil {
+		db.mu.Unlock()
 		return nil, err
 	}
 
 	if plan.write && db.aof != nil {
 		if err := db.aof.AppendCommands(index, plan.aofCommands); err != nil {
+			db.mu.Unlock()
 			return nil, err
 		}
 	}
 
 	reply, err := plan.exec()
 	if err != nil {
+		db.mu.Unlock()
 		return nil, err
 	}
 	if recordStats && plan.write {
@@ -146,6 +161,10 @@ func (db *Db) exec(index int, args [][]byte, recordStats bool) (interface{}, err
 	if recordStats {
 		atomic.AddInt64(&db.totalCommands, 1)
 	}
+	if plan.write && len(plan.aofCommands) > 0 && db.replication != nil {
+		db.replication.Propagate(index, plan.aofCommands)
+	}
+	db.mu.Unlock()
 
 	return reply, nil
 }
@@ -166,14 +185,14 @@ func (db *Db) EnableAOF(policy aof.SyncPolicy) error {
 
 func (db *Db) RewriteAOF(ctx context.Context) error {
 	if db.aof == nil {
-		return errors.New("aof is not enabled")
+		return errAOFDisabled
 	}
 	return db.aof.Rewrite(ctx)
 }
 
 func (db *Db) StartAutoRewriteLoop(interval time.Duration, minSizeBytes int64, growthPercent float64) error {
 	if db.aof == nil {
-		return errors.New("aof is not enabled")
+		return errAOFDisabled
 	}
 	db.aof.StartAutoRewriteLoop(interval, minSizeBytes, growthPercent)
 	return nil
@@ -235,6 +254,9 @@ func (db *Db) Close() {
 	if db.aof != nil {
 		db.aof.Close()
 	}
+	if db.replication != nil {
+		db.replication.Close()
+	}
 }
 
 func (db *Db) snapshotForRewrite() ([]aof.RewriteCommand, error) {
@@ -289,15 +311,13 @@ func (db *Db) snapshotForRewrite() ([]aof.RewriteCommand, error) {
 }
 
 func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
-	if len(args) == 0 {
-		return commandPlan{}, errors.New("empty command")
+	spec, err := commandSpecForArgs(args)
+	if err != nil {
+		return commandPlan{}, err
 	}
 
-	cmd := strings.ToUpper(string(args[0]))
+	cmd := spec.name
 	if cmd == "PING" {
-		if len(args) > 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'ping'")
-		}
 		if len(args) == 2 {
 			message := append([]byte(nil), args[1]...)
 			return commandPlan{
@@ -313,9 +333,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "ECHO" {
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'echo'")
-		}
 		message := append([]byte(nil), args[1]...)
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -324,9 +341,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "INFO" {
-		if len(args) > 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'info'")
-		}
 		section := "default"
 		if len(args) == 2 {
 			section = strings.ToLower(string(args[1]))
@@ -338,16 +352,12 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "SELECT" {
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'select'")
-		}
-
 		nextDB, err := strconv.Atoi(string(args[1]))
 		if err != nil {
-			return commandPlan{}, errors.New("invalid index argument")
+			return commandPlan{}, errValueOutOfRange
 		}
 		if nextDB < 0 || nextDB >= MaxNumber {
-			return commandPlan{}, errors.New("DB index out of range")
+			return commandPlan{}, errDBIndexOutOfRange
 		}
 
 		return commandPlan{
@@ -357,13 +367,10 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 	}
 	if cmd == "BGREWRITEAOF" {
-		if len(args) != 1 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'bgrewriteaof'")
-		}
 		return commandPlan{
 			exec: func() (interface{}, error) {
 				if db.aof == nil {
-					return nil, errors.New("aof is not enabled")
+					return nil, errAOFDisabled
 				}
 				if err := db.aof.RewriteAsync(30 * time.Second); err != nil {
 					return nil, err
@@ -380,10 +387,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 
 	switch cmd {
 	case "EXISTS":
-		if len(args) < 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'exists'")
-		}
-
 		keys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
@@ -401,10 +404,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "MGET":
-		if len(args) < 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'mget'")
-		}
-
 		keys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
@@ -429,15 +428,11 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "SET":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'set'")
-		}
-
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
 		aofCommands := db.setAOFCommands(dict, key, value, 0)
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: aofCommands,
 			exec: func() (interface{}, error) {
 				dict.Set(key, NewDataObject(value))
@@ -446,17 +441,13 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "MSET":
-		if len(args) < 3 || len(args)%2 == 0 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'mset'")
-		}
-
 		pairs := make([][]byte, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			pairs = append(pairs, append([]byte(nil), args[i]...))
 		}
 		aofArgs := copyCommand(args)
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{aofArgs},
 			exec: func() (interface{}, error) {
 				for i := 0; i < len(pairs); i += 2 {
@@ -469,26 +460,22 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "SETWITHTTL":
-		if len(args) != 4 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'setwithttl'")
-		}
-
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
 		ttl, err := strconv.ParseInt(string(args[3]), 10, 64)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid ttl argument")
+			return commandPlan{}, errValueOutOfRange
 		}
 		if ttl <= 0 {
-			return commandPlan{}, errors.New("invalid ttl argument")
+			return commandPlan{}, errValueOutOfRange
 		}
 		expireAtMs, expireAtNano, err := expireAtFromTTL(ttl)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid ttl argument")
+			return commandPlan{}, errValueOutOfRange
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: db.setAOFCommands(dict, key, value, expireAtMs),
 			exec: func() (interface{}, error) {
 				dict.SetWithExpireAt(key, NewDataObject(value), expireAtNano)
@@ -497,23 +484,19 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "SETWITHPXAT":
-		if len(args) != 4 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'setwithpxat'")
-		}
-
 		key := string(args[1])
 		value := append([]byte(nil), args[2]...)
 		expireAtMs, err := strconv.ParseInt(string(args[3]), 10, 64)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid expire time")
+			return commandPlan{}, errValueOutOfRange
 		}
 		expireAtNano, err := expireAtNanoFromMs(expireAtMs)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid expire time")
+			return commandPlan{}, errValueOutOfRange
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: db.setAOFCommands(dict, key, value, expireAtMs),
 			exec: func() (interface{}, error) {
 				dict.SetWithExpireAt(key, NewDataObject(value), expireAtNano)
@@ -522,26 +505,22 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "EXPIRE":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'expire'")
-		}
-
 		key := string(args[1])
 		ttlSec, err := strconv.ParseInt(string(args[2]), 10, 64)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid expire time")
+			return commandPlan{}, errValueOutOfRange
 		}
 		ttlMs := int64(0)
 		expireAtMs := int64(0)
 		expireAtNano := int64(0)
 		if ttlSec > 0 {
 			if ttlSec > maxInt64/1000 {
-				return commandPlan{}, errors.New("invalid expire time")
+				return commandPlan{}, errValueOutOfRange
 			}
 			ttlMs = ttlSec * 1000
 			expireAtMs, expireAtNano, err = expireAtFromTTL(ttlMs)
 			if err != nil {
-				return commandPlan{}, errors.New("invalid expire time")
+				return commandPlan{}, errValueOutOfRange
 			}
 		}
 		if !dict.Exists(key) {
@@ -549,7 +528,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: expireAOFCommands(key, ttlMs, expireAtMs),
 			exec: func() (interface{}, error) {
 				if ttlMs <= 0 {
@@ -566,21 +545,17 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PEXPIRE":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'pexpire'")
-		}
-
 		key := string(args[1])
 		ttlMs, err := strconv.ParseInt(string(args[2]), 10, 64)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid expire time")
+			return commandPlan{}, errValueOutOfRange
 		}
 		expireAtMs := int64(0)
 		expireAtNano := int64(0)
 		if ttlMs > 0 {
 			expireAtMs, expireAtNano, err = expireAtFromTTL(ttlMs)
 			if err != nil {
-				return commandPlan{}, errors.New("invalid expire time")
+				return commandPlan{}, errValueOutOfRange
 			}
 		}
 		if !dict.Exists(key) {
@@ -588,7 +563,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: expireAOFCommands(key, ttlMs, expireAtMs),
 			exec: func() (interface{}, error) {
 				if ttlMs <= 0 {
@@ -605,25 +580,21 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PEXPIREAT":
-		if len(args) != 3 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'pexpireat'")
-		}
-
 		key := string(args[1])
 		expireAtMs, err := strconv.ParseInt(string(args[2]), 10, 64)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid expire time")
+			return commandPlan{}, errValueOutOfRange
 		}
 		expireAtNano, err := expireAtNanoFromMs(expireAtMs)
 		if err != nil {
-			return commandPlan{}, errors.New("invalid expire time")
+			return commandPlan{}, errValueOutOfRange
 		}
 		if !dict.Exists(key) {
 			return staticIntegerPlan(0), nil
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{makeCommand("PEXPIREAT", key, strconv.FormatInt(expireAtMs, 10))},
 			exec: func() (interface{}, error) {
 				if dict.ExpireAt(key, expireAtNano) {
@@ -634,10 +605,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "TTL":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'ttl'")
-		}
-
 		key := string(args[1])
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -646,10 +613,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PTTL":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'pttl'")
-		}
-
 		key := string(args[1])
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -658,16 +621,12 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "PERSIST":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'persist'")
-		}
-
 		key := string(args[1])
 		if !dict.HasExpire(key) {
 			return staticIntegerPlan(0), nil
 		}
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{makeCommand("PERSIST", key)},
 			exec: func() (interface{}, error) {
 				if dict.Persist(key) {
@@ -678,10 +637,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "GET":
-		if len(args) != 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'get'")
-		}
-
 		key := string(args[1])
 		return commandPlan{
 			exec: func() (interface{}, error) {
@@ -699,10 +654,6 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}, nil
 
 	case "DEL":
-		if len(args) < 2 {
-			return commandPlan{}, errors.New("wrong number of arguments for 'del'")
-		}
-
 		keys := make([]string, 0, len(args)-1)
 		for i := 1; i < len(args); i++ {
 			keys = append(keys, string(args[i]))
@@ -713,7 +664,7 @@ func (db *Db) makeCommandPlan(index int, args [][]byte) (commandPlan, error) {
 		}
 
 		return commandPlan{
-			write:       true,
+			write:       spec.write,
 			aofCommands: [][][]byte{makeCommand(append([]string{"DEL"}, existingKeys...)...)},
 			exec: func() (interface{}, error) {
 				for _, key := range existingKeys {
@@ -859,14 +810,39 @@ func parseSelectIndex(args [][]byte) (int, bool) {
 func (db *Db) infoReply(section string) ([]byte, error) {
 	switch section {
 	case "default", "all":
-		return joinInfoSections(db.persistenceInfoBytes(), db.statsInfoBytes()), nil
+		return joinInfoSections(db.serverInfoBytes(), db.persistenceInfoBytes(), db.statsInfoBytes(), db.replicationInfoBytes()), nil
+	case "server":
+		return db.serverInfoBytes(), nil
 	case "persistence":
 		return db.persistenceInfoBytes(), nil
 	case "stats":
 		return db.statsInfoBytes(), nil
+	case "replication":
+		return db.replicationInfoBytes(), nil
 	default:
-		return nil, fmt.Errorf("unsupported INFO section '%s'", section)
+		return nil, fmt.Errorf(errUnsupportedInfoFormat, section)
 	}
+}
+
+func (db *Db) serverInfoBytes() []byte {
+	uptimeSeconds := int64(time.Since(db.startTime).Seconds())
+	if uptimeSeconds < 0 {
+		uptimeSeconds = 0
+	}
+
+	lines := []string{
+		"# Server",
+		"server_name:redis-golang",
+		"redis_mode:standalone",
+		fmt.Sprintf("process_id:%d", os.Getpid()),
+		fmt.Sprintf("go_version:%s", runtime.Version()),
+		fmt.Sprintf("arch_bits:%d", strconv.IntSize),
+		fmt.Sprintf("uptime_in_seconds:%d", uptimeSeconds),
+		fmt.Sprintf("uptime_in_days:%d", uptimeSeconds/(24*60*60)),
+		fmt.Sprintf("db_count:%d", len(db.dicts)),
+	}
+
+	return []byte(strings.Join(lines, "\r\n") + "\r\n")
 }
 
 func (db *Db) persistenceInfoBytes() []byte {

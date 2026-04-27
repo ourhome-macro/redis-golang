@@ -20,8 +20,8 @@ const (
 )
 
 var (
-	errLineTooLarge = errors.New("protocol line too large")
-	errMissingCRLF  = errors.New("missing CRLF")
+	errLineTooLarge = errors.New("protocol error: line too large")
+	errMissingCRLF  = errors.New("protocol error: missing CRLF")
 )
 
 type Payload struct {
@@ -45,7 +45,7 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 			return
 		}
 		if len(line) == 0 {
-			ch <- &Payload{Err: errors.New("empty line")}
+			ch <- &Payload{Err: errors.New("protocol error: empty line")}
 			continue
 		}
 		switch line[0] {
@@ -60,7 +60,7 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 		case ':':
 			content, err := strconv.ParseInt(string(line[1:]), 10, 64)
 			if err != nil {
-				ch <- &Payload{Err: errors.New("::invalid parseInt")}
+				ch <- &Payload{Err: errors.New("protocol error: invalid integer")}
 				return
 			}
 			ch <- &Payload{
@@ -75,7 +75,7 @@ func parse(rawReader io.Reader, ch chan *Payload) {
 				return
 			}
 		default:
-			ch <- &Payload{Err: errors.New("error pattern.please write again")}
+			ch <- &Payload{Err: errors.New("protocol error: unexpected leading byte")}
 		}
 	}
 }
@@ -105,11 +105,11 @@ func readLine(reader *bufio.Reader) ([]byte, error) {
 
 func emitReadError(ch chan<- *Payload, err error) {
 	if err == io.EOF {
-		ch <- &Payload{Err: errors.New("EOF")}
+		ch <- &Payload{Err: io.EOF}
 		return
 	}
 	if errors.Is(err, os.ErrDeadlineExceeded) {
-		ch <- &Payload{Err: errors.New("os.ErrDeadlineExceeded")}
+		ch <- &Payload{Err: os.ErrDeadlineExceeded}
 		return
 	}
 	ch <- &Payload{Err: err}
@@ -118,11 +118,11 @@ func emitReadError(ch chan<- *Payload, err error) {
 func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) bool {
 	nStrs, err := strconv.ParseInt(string(header[1:]), 10, 64)
 	if err != nil || nStrs < -1 {
-		ch <- &Payload{Err: errors.New("invalid array format")}
+		ch <- &Payload{Err: errors.New("protocol error: invalid array format")}
 		return false
 	}
 	if nStrs > MaxArrayLength {
-		ch <- &Payload{Err: errors.New("array length too large")}
+		ch <- &Payload{Err: errors.New("protocol error: array length too large")}
 		return false
 	}
 	if nStrs == -1 {
@@ -146,22 +146,22 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) bool {
 	for i := int64(0); i < nStrs; i++ {
 		line, err := readLine(reader)
 		if err != nil {
-			ch <- &Payload{Err: errors.New("invalid array length")}
+			ch <- &Payload{Err: errors.New("protocol error: invalid array length")}
 			return false
 		}
 
 		if len(line) < 2 || line[0] != '$' {
-			ch <- &Payload{Err: errors.New("invalid array element header")}
+			ch <- &Payload{Err: errors.New("protocol error: invalid array element header")}
 			return false
 		}
 
 		strLen, err := strconv.ParseInt(string(line[1:]), 10, 64)
 		if err != nil || strLen < -1 {
-			ch <- &Payload{Err: errors.New("invalid array bulk length")}
+			ch <- &Payload{Err: errors.New("protocol error: invalid array bulk length")}
 			return false
 		}
 		if strLen > MaxBulkLength {
-			ch <- &Payload{Err: errors.New("array bulk length too large")}
+			ch <- &Payload{Err: errors.New("protocol error: array bulk length too large")}
 			return false
 		}
 
@@ -172,7 +172,7 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) bool {
 
 		body, err := readBulkBody(reader, int(strLen))
 		if err != nil {
-			ch <- &Payload{Err: errors.New("invalid array parse")}
+			ch <- &Payload{Err: errors.New("protocol error: invalid array parse")}
 			return false
 		}
 		lines = append(lines, body)
@@ -186,11 +186,11 @@ func parseArray(reader *bufio.Reader, ch chan<- *Payload, header []byte) bool {
 func parseBulk(reader *bufio.Reader, ch chan<- *Payload, line []byte) bool {
 	strlen, err := strconv.ParseInt(string(line[1:]), 10, 64)
 	if err != nil || strlen < -1 {
-		ch <- &Payload{Err: errors.New("invalid bulk length")}
+		ch <- &Payload{Err: errors.New("protocol error: invalid bulk length")}
 		return false
 	}
 	if strlen > MaxBulkLength {
-		ch <- &Payload{Err: errors.New("bulk string too large")}
+		ch <- &Payload{Err: errors.New("protocol error: bulk string too large")}
 		return false
 	}
 
@@ -203,7 +203,7 @@ func parseBulk(reader *bufio.Reader, ch chan<- *Payload, line []byte) bool {
 
 	strBuf, err := readBulkBody(reader, int(strlen))
 	if err != nil {
-		ch <- &Payload{Err: errors.New("invalid bulk parse")}
+		ch <- &Payload{Err: errors.New("protocol error: invalid bulk parse")}
 		return false
 	}
 	ch <- &Payload{
