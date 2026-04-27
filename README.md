@@ -76,6 +76,17 @@ Configuration defaults remain compatible with the previous hard-coded startup:
 | `--active-expire-interval` | `100ms` | Active expiration loop interval. |
 | `--active-expire-limit-per-db` | `1000` | Maximum expired keys removed per DB per cycle. `0` means unlimited. |
 
+Validation rules:
+
+- `--addr` takes precedence over `--host` and `--port`. Both `--addr` and `--host` are trimmed before validation.
+- `--host` must be non-empty when `--addr` is not set. `--port` must stay within `1..65535`.
+- `--maxconn` must stay within `0..4294967295`. `0` still means unlimited.
+- `--timeout` must be `>= 0`. `0` still disables read deadlines.
+- When `--aof-auto-rewrite=true`, `--aof-auto-rewrite-interval` must be `> 0`. If auto rewrite is disabled, the interval is still parsed but not used. `--aof-auto-rewrite-min-size` and `--aof-auto-rewrite-growth-percent` must both be `>= 0`.
+- When `--active-expire=true`, `--active-expire-interval` must be `> 0`. If active expiration is disabled, the interval is still parsed but not used. `--active-expire-limit-per-db` must be `>= 0`, and `0` still means unlimited.
+
+Default listen address remains `127.0.0.1:8080` (see `redis/config/config.go`).
+
 默认监听地址：`127.0.0.1:8080`（见 `redis/config/config.go`）。
 
 ### 2) 启动交互 CLI

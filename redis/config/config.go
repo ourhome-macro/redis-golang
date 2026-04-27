@@ -24,6 +24,8 @@ const (
 
 	DefaultActiveExpireInterval   = 100 * time.Millisecond
 	DefaultActiveExpireLimitPerDB = 1000
+
+	maxTCPConnections = uint64(^uint32(0))
 )
 
 type Config struct {
@@ -94,8 +96,9 @@ func ParseFlags(name string, args []string, output io.Writer) (Config, error) {
 		return Config{}, err
 	}
 	if fs.NArg() > 0 {
-		return Config{}, fmt.Errorf("unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
+		return Config{}, fmt.Errorf("unexpected positional arguments: %s", quoteArgs(fs.Args()))
 	}
+	cfg = normalizeConfig(cfg)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -103,38 +106,39 @@ func ParseFlags(name string, args []string, output io.Writer) (Config, error) {
 }
 
 func BindFlags(fs *flag.FlagSet, cfg *Config) {
-	fs.StringVar(&cfg.Server.Address, "addr", cfg.Server.Address, "full listen address override in host:port form")
+	fs.StringVar(&cfg.Server.Address, "addr", cfg.Server.Address, "full listen address override in host:port form; when set, host and port flags are ignored")
 	fs.StringVar(&cfg.Server.Host, "host", cfg.Server.Host, "listen host used when -addr is empty")
-	fs.IntVar(&cfg.Server.Port, "port", cfg.Server.Port, "listen port used when -addr is empty")
-	fs.UintVar(&cfg.Server.MaxConn, "maxconn", cfg.Server.MaxConn, "maximum concurrent client connections; 0 means unlimited")
-	fs.DurationVar(&cfg.Server.Timeout, "timeout", cfg.Server.Timeout, "idle read timeout; 0 disables read deadlines")
+	fs.IntVar(&cfg.Server.Port, "port", cfg.Server.Port, "listen port used when -addr is empty; must be between 1 and 65535")
+	fs.UintVar(&cfg.Server.MaxConn, "maxconn", cfg.Server.MaxConn, "maximum concurrent client connections; 0 means unlimited; must not exceed 4294967295")
+	fs.DurationVar(&cfg.Server.Timeout, "timeout", cfg.Server.Timeout, "idle read timeout; 0 disables read deadlines; must not be negative")
 
 	fs.Var(syncPolicyValue{target: &cfg.AOF.SyncPolicy}, "aof-sync", "AOF fsync policy: always, everysec, no")
 	fs.BoolVar(&cfg.AOF.AutoRewrite, "aof-auto-rewrite", cfg.AOF.AutoRewrite, "enable automatic AOF rewrite")
-	fs.DurationVar(&cfg.AOF.AutoRewriteInterval, "aof-auto-rewrite-interval", cfg.AOF.AutoRewriteInterval, "automatic AOF rewrite check interval")
-	fs.Int64Var(&cfg.AOF.AutoRewriteMinSizeBytes, "aof-auto-rewrite-min-size", cfg.AOF.AutoRewriteMinSizeBytes, "minimum AOF size in bytes before automatic rewrite can trigger")
-	fs.Float64Var(&cfg.AOF.AutoRewriteGrowthPercent, "aof-auto-rewrite-growth-percent", cfg.AOF.AutoRewriteGrowthPercent, "AOF growth percentage required to trigger automatic rewrite")
+	fs.DurationVar(&cfg.AOF.AutoRewriteInterval, "aof-auto-rewrite-interval", cfg.AOF.AutoRewriteInterval, "automatic AOF rewrite check interval; must be positive when -aof-auto-rewrite is true")
+	fs.Int64Var(&cfg.AOF.AutoRewriteMinSizeBytes, "aof-auto-rewrite-min-size", cfg.AOF.AutoRewriteMinSizeBytes, "minimum AOF size in bytes before automatic rewrite can trigger; must not be negative")
+	fs.Float64Var(&cfg.AOF.AutoRewriteGrowthPercent, "aof-auto-rewrite-growth-percent", cfg.AOF.AutoRewriteGrowthPercent, "AOF growth percentage required to trigger automatic rewrite; must not be negative")
 
 	fs.BoolVar(&cfg.ActiveExpire.Enabled, "active-expire", cfg.ActiveExpire.Enabled, "enable active expiration loop")
-	fs.DurationVar(&cfg.ActiveExpire.Interval, "active-expire-interval", cfg.ActiveExpire.Interval, "active expiration loop interval")
-	fs.IntVar(&cfg.ActiveExpire.LimitPerDB, "active-expire-limit-per-db", cfg.ActiveExpire.LimitPerDB, "maximum expired keys removed per DB per active expiration cycle; 0 means unlimited")
+	fs.DurationVar(&cfg.ActiveExpire.Interval, "active-expire-interval", cfg.ActiveExpire.Interval, "active expiration loop interval; must be positive when -active-expire is true")
+	fs.IntVar(&cfg.ActiveExpire.LimitPerDB, "active-expire-limit-per-db", cfg.ActiveExpire.LimitPerDB, "maximum expired keys removed per DB per active expiration cycle; 0 means unlimited; must not be negative")
 }
 
 func (cfg Config) Validate() error {
+	cfg = normalizeConfig(cfg)
 	if cfg.Server.Address != "" {
 		if err := validateAddress(cfg.Server.Address); err != nil {
 			return fmt.Errorf("addr: %w", err)
 		}
 	} else {
 		if cfg.Server.Host == "" {
-			return fmt.Errorf("host must not be empty")
+			return fmt.Errorf("host must not be empty when addr is not set")
 		}
 		if err := validatePort(cfg.Server.Port); err != nil {
 			return fmt.Errorf("port: %w", err)
 		}
 	}
-	if uint64(cfg.Server.MaxConn) > uint64(^uint32(0)) {
-		return fmt.Errorf("maxconn must not exceed %d", uint64(^uint32(0)))
+	if uint64(cfg.Server.MaxConn) > maxTCPConnections {
+		return fmt.Errorf("maxconn must be between 0 and %d", maxTCPConnections)
 	}
 	if cfg.Server.Timeout < 0 {
 		return fmt.Errorf("timeout must not be negative")
@@ -142,8 +146,11 @@ func (cfg Config) Validate() error {
 	if !isSyncPolicyValid(cfg.AOF.SyncPolicy) {
 		return fmt.Errorf("aof-sync has invalid internal value %d", cfg.AOF.SyncPolicy)
 	}
-	if cfg.AOF.AutoRewriteInterval <= 0 {
-		return fmt.Errorf("aof-auto-rewrite-interval must be positive")
+	if cfg.AOF.AutoRewriteInterval < 0 {
+		return fmt.Errorf("aof-auto-rewrite-interval must not be negative")
+	}
+	if cfg.AOF.AutoRewrite && cfg.AOF.AutoRewriteInterval == 0 {
+		return fmt.Errorf("aof-auto-rewrite-interval must be positive when aof-auto-rewrite is enabled")
 	}
 	if cfg.AOF.AutoRewriteMinSizeBytes < 0 {
 		return fmt.Errorf("aof-auto-rewrite-min-size must not be negative")
@@ -151,8 +158,11 @@ func (cfg Config) Validate() error {
 	if cfg.AOF.AutoRewriteGrowthPercent < 0 {
 		return fmt.Errorf("aof-auto-rewrite-growth-percent must not be negative")
 	}
-	if cfg.ActiveExpire.Interval <= 0 {
-		return fmt.Errorf("active-expire-interval must be positive")
+	if cfg.ActiveExpire.Interval < 0 {
+		return fmt.Errorf("active-expire-interval must not be negative")
+	}
+	if cfg.ActiveExpire.Enabled && cfg.ActiveExpire.Interval == 0 {
+		return fmt.Errorf("active-expire-interval must be positive when active-expire is enabled")
 	}
 	if cfg.ActiveExpire.LimitPerDB < 0 {
 		return fmt.Errorf("active-expire-limit-per-db must not be negative")
@@ -161,6 +171,7 @@ func (cfg Config) Validate() error {
 }
 
 func (cfg Config) ListenAddress() string {
+	cfg = normalizeConfig(cfg)
 	if cfg.Server.Address != "" {
 		return cfg.Server.Address
 	}
@@ -231,6 +242,20 @@ func isSyncPolicyValid(policy aof.SyncPolicy) bool {
 	default:
 		return false
 	}
+}
+
+func normalizeConfig(cfg Config) Config {
+	cfg.Server.Address = strings.TrimSpace(cfg.Server.Address)
+	cfg.Server.Host = strings.TrimSpace(cfg.Server.Host)
+	return cfg
+}
+
+func quoteArgs(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, strconv.Quote(arg))
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func validateAddress(address string) error {

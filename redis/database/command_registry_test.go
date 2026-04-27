@@ -4,27 +4,27 @@ import "testing"
 
 func TestCommandRegistryMetadata(t *testing.T) {
 	expected := map[string]commandSpec{
-		"PING":         {name: "PING", minArity: 1, maxArity: 2},
-		"ECHO":         {name: "ECHO", minArity: 2, maxArity: 2},
-		"INFO":         {name: "INFO", minArity: 1, maxArity: 2},
-		"SELECT":       {name: "SELECT", minArity: 2, maxArity: 2},
-		"BGREWRITEAOF": {name: "BGREWRITEAOF", minArity: 1, maxArity: 1},
+		"PING":         {name: "PING", minArity: 1, maxArity: 2, argStep: 1},
+		"ECHO":         {name: "ECHO", minArity: 2, maxArity: 2, argStep: 1},
+		"INFO":         {name: "INFO", minArity: 1, maxArity: 2, argStep: 1},
+		"SELECT":       {name: "SELECT", minArity: 2, maxArity: 2, argStep: 1},
+		"BGREWRITEAOF": {name: "BGREWRITEAOF", minArity: 1, maxArity: 1, argStep: 1},
 
-		"EXISTS": {name: "EXISTS", minArity: 2, maxArity: variableArity, keyspace: true},
-		"MGET":   {name: "MGET", minArity: 2, maxArity: variableArity, keyspace: true},
-		"GET":    {name: "GET", minArity: 2, maxArity: 2, keyspace: true},
-		"TTL":    {name: "TTL", minArity: 2, maxArity: 2, keyspace: true},
-		"PTTL":   {name: "PTTL", minArity: 2, maxArity: 2, keyspace: true},
+		"EXISTS": {name: "EXISTS", minArity: 2, maxArity: variableArity, argStep: 1, keyspace: true, firstKey: 1, lastKey: -1, keyStep: 1},
+		"MGET":   {name: "MGET", minArity: 2, maxArity: variableArity, argStep: 1, keyspace: true, firstKey: 1, lastKey: -1, keyStep: 1},
+		"GET":    {name: "GET", minArity: 2, maxArity: 2, argStep: 1, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"TTL":    {name: "TTL", minArity: 2, maxArity: 2, argStep: 1, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"PTTL":   {name: "PTTL", minArity: 2, maxArity: 2, argStep: 1, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
 
-		"SET":         {name: "SET", minArity: 3, maxArity: 3, write: true, keyspace: true},
-		"MSET":        {name: "MSET", minArity: 3, maxArity: variableArity, write: true, keyspace: true},
-		"SETWITHTTL":  {name: "SETWITHTTL", minArity: 4, maxArity: 4, write: true, keyspace: true},
-		"SETWITHPXAT": {name: "SETWITHPXAT", minArity: 4, maxArity: 4, write: true, keyspace: true},
-		"EXPIRE":      {name: "EXPIRE", minArity: 3, maxArity: 3, write: true, keyspace: true},
-		"PEXPIRE":     {name: "PEXPIRE", minArity: 3, maxArity: 3, write: true, keyspace: true},
-		"PEXPIREAT":   {name: "PEXPIREAT", minArity: 3, maxArity: 3, write: true, keyspace: true},
-		"PERSIST":     {name: "PERSIST", minArity: 2, maxArity: 2, write: true, keyspace: true},
-		"DEL":         {name: "DEL", minArity: 2, maxArity: variableArity, write: true, keyspace: true},
+		"SET":         {name: "SET", minArity: 3, maxArity: 3, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"MSET":        {name: "MSET", minArity: 3, maxArity: variableArity, argStep: 2, write: true, keyspace: true, firstKey: 1, lastKey: -1, keyStep: 2},
+		"SETWITHTTL":  {name: "SETWITHTTL", minArity: 4, maxArity: 4, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"SETWITHPXAT": {name: "SETWITHPXAT", minArity: 4, maxArity: 4, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"EXPIRE":      {name: "EXPIRE", minArity: 3, maxArity: 3, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"PEXPIRE":     {name: "PEXPIRE", minArity: 3, maxArity: 3, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"PEXPIREAT":   {name: "PEXPIREAT", minArity: 3, maxArity: 3, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"PERSIST":     {name: "PERSIST", minArity: 2, maxArity: 2, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: 1, keyStep: 1},
+		"DEL":         {name: "DEL", minArity: 2, maxArity: variableArity, argStep: 1, write: true, keyspace: true, firstKey: 1, lastKey: -1, keyStep: 1},
 	}
 
 	if len(commandRegistry) != len(expected) {
@@ -80,6 +80,37 @@ func TestCommandSpecForArgsErrorsMatchExistingSemantics(t *testing.T) {
 			}
 			if err.Error() != tt.want {
 				t.Fatalf("got error %q, want %q", err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+func TestCommandSpecKeyArgumentIndexes(t *testing.T) {
+	tests := []struct {
+		name string
+		args [][]byte
+		want []int
+	}{
+		{name: "get", args: commandTestArgs("GET", "k"), want: []int{1}},
+		{name: "mset", args: commandTestArgs("MSET", "a", "1", "b", "2"), want: []int{1, 3}},
+		{name: "del", args: commandTestArgs("DEL", "a", "b", "c"), want: []int{1, 2, 3}},
+		{name: "ping", args: commandTestArgs("PING"), want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, err := commandSpecForArgs(tt.args)
+			if err != nil {
+				t.Fatalf("commandSpecForArgs failed: %v", err)
+			}
+			got := spec.keyArgumentIndexes(len(tt.args))
+			if len(got) != len(tt.want) {
+				t.Fatalf("keyArgumentIndexes len=%d, want %d (%v)", len(got), len(tt.want), got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("keyArgumentIndexes[%d]=%d, want %d", i, got[i], tt.want[i])
+				}
 			}
 		})
 	}
